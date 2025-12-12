@@ -1,6 +1,6 @@
-# Fake News Detection (Fact Verification) - ViFactCheck + Multi-Agent Debate
+# Fact Verification
 
-Dự án này xây dựng một pipeline **Fact Verification (kiểm chứng thông tin)** cho tiếng Việt dựa trên bộ dữ liệu **ViFactCheck**.
+Dự án này xây dựng một pipeline **Fact Verification (xác minh tuyên bố)** cho tiếng Việt dựa trên bộ dữ liệu **ViFactCheck**.
 
 Mục tiêu:
 - Dự đoán quan hệ giữa **Tuyên bố** và **Bằng chứng** theo 3 nhãn:
