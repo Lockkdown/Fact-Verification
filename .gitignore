@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+.envrc
+
+# Environment / secrets
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
+
+# Local caches
+.cache/
+pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# HuggingFace / Transformers cache
+hf_cache/
+**/.hf_cache/
+**/huggingface/
+**/transformers_cache/
+
+# Torch / training artifacts
+runs/
+wandb/
+mlruns/
+lightning_logs/
+
+# Project outputs
+results/
+
+# Resources / docs / configs
+resources/
+docs/
+config/
+
+# Data (keep only small samples; commit via separate sample folder if needed)
+dataset/
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Gradio temporary
+gradio_cached_examples/
+
+# Tools (large local dependencies)
+tools/VnCoreNLP-1.2/
+
+# IDE project metadata
+.windsurf/
+
