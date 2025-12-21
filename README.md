@@ -14,7 +14,61 @@ Mục tiêu:
 
 ## Kiến trúc tổng quan
 
-### Flow Diagram
+### Flow Diagram (Mermaid)
+
+```mermaid
+flowchart TD
+    subgraph INPUT["📥 INPUT"]
+        A[Claim + Evidence]
+    end
+
+    subgraph MODEL["🤖 PhoBERT Model"]
+        B[3-label Classifier<br/>SUPPORT | REFUTE | NEI]
+    end
+
+    subgraph HYBRID["⚖️ HYBRID DECISION"]
+        C{Confidence ≥ 85%?}
+    end
+
+    subgraph FAST["⚡ FAST PATH"]
+        D[Trust Model<br/>+ LIME XAI]
+    end
+
+    subgraph SLOW["🔥 SLOW PATH - Multi-Agent Debate"]
+        subgraph DEBATORS["👥 DEBATORS"]
+            E1[D1: Support]
+            E2[D2: Refute]
+            E3[D3: NEI]
+        end
+        F[🔄 2 Rounds<br/>Arguments & Rebuttals]
+        G[👨‍⚖️ JUDGE<br/>Final Verdict + Confidence]
+    end
+
+    subgraph OUTPUT["📊 OUTPUT"]
+        H[FINAL VERDICT<br/>SUPPORTED | REFUTED | NEI]
+        I[💡 XAI GENERATOR<br/>• Summary<br/>• Key Evidence<br/>• Reasoning Chain]
+    end
+
+    A --> B
+    B -->|Verdict + Conf| C
+    C -->|YES ≥85%| D
+    C -->|NO <85%| E1 & E2 & E3
+    E1 & E2 & E3 --> F
+    F --> G
+    D --> H
+    G --> H
+    H --> I
+
+    style INPUT fill:#e1f5fe
+    style MODEL fill:#fff3e0
+    style HYBRID fill:#fce4ec
+    style FAST fill:#e8f5e9
+    style SLOW fill:#fff8e1
+    style OUTPUT fill:#f3e5f5
+```
+
+<details>
+<summary>📋 ASCII Version (backup)</summary>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -46,7 +100,7 @@ Mục tiêu:
                                     │
                    ┌────────────────┴────────────────┐
                    │                                 │
-        YES (≥85%) |                                 | NO (<85%)
+        YES (≥85%) │                                 │ NO (<85%)
                    │                                 │
                    ▼                                 ▼
     ┌──────────────────────────┐    ┌──────────────────────────────────────┐
@@ -64,7 +118,7 @@ Mục tiêu:
                  │                  │  │              ▼                  │ │
                  │                  │  │    ┌─────────────────┐          │ │
                  │                  │  │    │   ROUNDS        │          │ │
-                 │                  │  │    │  (2rounds)      │          │ │
+                 │                  │  │    │  (2 rounds)     │          │ │
                  │                  │  │    │   Arguments &   │          │ │
                  │                  │  │    │   Rebuttals     │          │ │
                  │                  │  │    └────────┬────────┘          │ │
@@ -74,8 +128,8 @@ Mục tiêu:
                  │                  │  │    │  Final Verdict  │          │ │
                  │                  │  │    │  + Confidence   │          │ │
                  │                  │  │    └────────┬────────┘          │ │
-                 │                  │  └─────────────┼─────────────────┘ │ |
-                 │                  │                │                   │ |
+                 │                  │  └─────────────┼─────────────────┘ │
+                 │                  │                │                   │
                  │                  └────────────────┼───────────────────┘
                  │                                   │
                  └────────────────┬──────────────────┘
@@ -96,12 +150,14 @@ Mục tiêu:
                     └─────────────────────────────┘
 ```
 
+</details>
+
 ### Mô tả 2 nhánh chính
 
-- **Fast Path (PhoBERT + XAI)**
+- **Fast Path (PhoBERT + LIME XAI)**
   - Kích hoạt khi model confidence **≥ 85%** (threshold có thể tune).
-  - Chạy nhanh, tiết kiệm API calls.
-  - XAI được sinh theo hướng "giải thích tự nhiên" (natural explanation).
+  - Chạy nhanh, tiết kiệm API calls (không gọi LLM).
+  - XAI sinh bằng **LIME** (rule-based) → giải thích tự nhiên + highlight conflict words.
 
 - **Slow Path (Multi-Agent Debate + Judge + XAI)**
   - Kích hoạt khi case khó / model confidence **< 85%**.
