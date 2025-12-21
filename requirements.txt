@@ -1,0 +1,16 @@
+aiohttp
+datasets
+gradio
+lime
+matplotlib
+numpy
+pandas
+py-vncorenlp
+pyvi
+python-dotenv
+requests
+scikit-learn
+seaborn
+torch
+tqdm
+transformers

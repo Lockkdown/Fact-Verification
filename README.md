@@ -13,16 +13,113 @@ Mục tiêu:
 ---
 
 ## Kiến trúc tổng quan
-Pipeline có 2 nhánh chính:
+
+### Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           HYBRID DEBATE PIPELINE                            │
+│                        (DOWN Framework - 2025)                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌───────────────┐
+                              │   INPUT       │
+                              │ Claim + Evid  │
+                              └───────┬───────┘
+                                      │
+                                      ▼
+                        ┌─────────────────────────┐
+                        │     PhoBERT Model       │
+                        │   (3-label classifier)  │
+                        │  SUPPORT│REFUTE│NEI     │
+                        └────────────┬────────────┘
+                                     │
+                            ┌────────┴────────┐
+                            │  Verdict + Conf │
+                            └────────┬────────┘
+                                     │
+                                     ▼
+                    ┌────────────────────────────────┐
+                    │     HYBRID DECISION            │
+                    │  Confidence >= 0.85 threshold? │
+                    └───────────────┬────────────────┘
+                                    │
+                   ┌────────────────┴────────────────┐
+                   │                                 │
+        YES (≥85%) |                                 | NO (<85%)
+                   │                                 │
+                   ▼                                 ▼
+    ┌──────────────────────────┐    ┌──────────────────────────────────────┐
+    │      FAST PATH           │    │          SLOW PATH                   │
+    │    Trust Model           │    │      Multi-Agent Debate              │
+    │    (Skip Debate)         │    │                                      │
+    └────────────┬─────────────┘    │  ┌─────────────────────────────────┐ │
+                 │                  │  │       DEBATORS (3 agents)       │ │
+                 │                  │  │  ┌─────┐  ┌─────┐  ┌─────┐      │ │
+                 │                  │  │  │ D1  │  │ D2  │  │ D3  │      │ │
+                 │                  │  │  │Supp │  │Refut│  │NEI  │      │ │
+                 │                  │  │  └──┬──┘  └──┬──┘  └──┬──┘      │ │
+                 │                  │  │     │        │        │         │ │
+                 │                  │  │     └────────┼────────┘         │ │
+                 │                  │  │              ▼                  │ │
+                 │                  │  │    ┌─────────────────┐          │ │
+                 │                  │  │    │   ROUNDS        │          │ │
+                 │                  │  │    │  (2rounds)      │          │ │
+                 │                  │  │    │   Arguments &   │          │ │
+                 │                  │  │    │   Rebuttals     │          │ │
+                 │                  │  │    └────────┬────────┘          │ │
+                 │                  │  │             ▼                   │ │
+                 │                  │  │    ┌─────────────────┐          │ │
+                 │                  │  │    │   JUDGE         │          │ │
+                 │                  │  │    │  Final Verdict  │          │ │
+                 │                  │  │    │  + Confidence   │          │ │
+                 │                  │  │    └────────┬────────┘          │ │
+                 │                  │  └─────────────┼─────────────────┘ │ |
+                 │                  │                │                   │ |
+                 │                  └────────────────┼───────────────────┘
+                 │                                   │
+                 └────────────────┬──────────────────┘
+                                  │
+                                  ▼
+                    ┌─────────────────────────────┐
+                    │       FINAL VERDICT         │
+                    │   SUPPORTED│REFUTED│NEI     │
+                    └──────────────┬──────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │       XAI GENERATOR         │
+                    │   Natural Language Explain  │
+                    │   - Summary                 │
+                    │   - Key Evidence            │
+                    │   - Reasoning Chain         │
+                    └─────────────────────────────┘
+```
+
+### Mô tả 2 nhánh chính
 
 - **Fast Path (PhoBERT + XAI)**
-  - Chạy nhanh, phù hợp khi mô hình có độ tin cậy cao.
-  - XAI được sinh theo hướng “giải thích tự nhiên” (natural explanation).
+  - Kích hoạt khi model confidence **≥ 85%** (threshold có thể tune).
+  - Chạy nhanh, tiết kiệm API calls.
+  - XAI được sinh theo hướng "giải thích tự nhiên" (natural explanation).
 
 - **Slow Path (Multi-Agent Debate + Judge + XAI)**
-  - Kích hoạt khi case khó / mô hình không chắc chắn.
-  - Nhiều debators tranh luận theo vòng (round), sau đó **Judge** tổng hợp và đưa ra kết luận cuối.
+  - Kích hoạt khi case khó / model confidence **< 85%**.
+  - 3 debators đại diện cho 3 stance: **Support**, **Refute**, **NEI**.
+  - Tranh luận qua 2-4 rounds với arguments & rebuttals.
+  - **Judge** tổng hợp và đưa ra kết luận cuối.
   - XAI được chuẩn hoá theo cùng schema với Fast Path.
+
+### Hybrid Strategy Logic
+
+```python
+if model_confidence >= threshold:  # Default: 0.85
+    final_verdict = model_verdict   # Trust Model → FAST PATH
+else:
+    final_verdict = debate_verdict  # Trust Debate → SLOW PATH
+```
+
+> **Research basis**: DOWN Framework (Debate Only When Necessary, 2025)
 
 ---
 
