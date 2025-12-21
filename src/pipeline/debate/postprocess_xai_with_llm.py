@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Add project root to path
 import sys
-project_root = Path(__file__).parent.parent
+# File is at src/pipeline/debate/postprocess_xai_with_llm.py -> go up 4 levels to project root
+project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # Load environment
@@ -116,7 +117,7 @@ class XAIGenerator:
     DEFAULT_BASE_URL_ENV = "OPENROUTER_BASE_URL"
     DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
     
-    # XAI-only prompt template
+    # XAI-only prompt template (synced with judge.py wording)
     XAI_PROMPT_TEMPLATE = """**TASK:** Generate XAI (Explainable AI) fields for a fact-checking verdict.
 
 **CONTEXT:**
@@ -132,12 +133,17 @@ Do NOT change or question the verdict. Just explain it clearly.
 {{
     "conflict_claim": "Nếu REFUTED: từ/cụm trong claim gây mâu thuẫn. Để trống '' nếu SUPPORTED/NEI",
     "conflict_evidence": "Nếu REFUTED: từ/cụm trong evidence mâu thuẫn với claim. Để trống '' nếu SUPPORTED/NEI",
-    "natural_explanation_vi": "Giải thích 1-2 câu ngắn gọn bằng tiếng Việt, dựa trên reasoning"
+    "natural_explanation_vi": "Giải thích 1-2 câu ngắn gọn bằng tiếng Việt theo format dưới đây"
 }}
 
 **RULES:**
-- conflict_*: Chỉ điền nếu verdict là REFUTED, để trống "" nếu SUPPORTED/NEI
-- natural_explanation_vi: Tóm tắt reasoning thành 1-2 câu dễ hiểu
+- conflict_claim/conflict_evidence: CHỈ điền nếu verdict là REFUTED, để trống "" nếu SUPPORTED/NEI
+- conflict_claim: phải là từ/cụm từ XUẤT HIỆN NGUYÊN VĂN trong tuyên bố (verbatim substring)
+- conflict_evidence: phải là từ/cụm từ XUẤT HIỆN NGUYÊN VĂN trong bằng chứng (verbatim substring)
+- natural_explanation_vi: Giải thích theo format:
+  - SUPPORTED: "Bằng chứng cung cấp thông tin phù hợp với tuyên bố."
+  - REFUTED: "Tuyên bố nói '[conflict_claim]' nhưng Bằng chứng nói '[conflict_evidence]'. Hai thông tin này mâu thuẫn."
+  - NEI: "Hiện tại, bằng chứng được cung cấp chưa đủ để kết luận tuyên bố đúng hay sai."
 
 **OUTPUT JSON:**"""
 
@@ -265,7 +271,8 @@ Do NOT change or question the verdict. Just explain it clearly.
         input_path: Path,
         backup: bool = True,
         concurrency: int = 10,
-        phobert_generator: Optional['PhoBERTXAIGenerator'] = None
+        phobert_generator: Optional['PhoBERTXAIGenerator'] = None,
+        force: bool = False
     ) -> Dict[str, Any]:
         """
         Process a single results file and add XAI.
@@ -312,8 +319,8 @@ Do NOT change or question the verdict. Just explain it clearly.
         for i, result in enumerate(results):
             if result.get("debate_result") is not None:
                 self.stats["samples_with_debate"] += 1
-                # Skip if already has XAI (resume support)
-                if result["debate_result"].get("xai"):
+                # Skip if already has XAI (resume support) unless --force
+                if result["debate_result"].get("xai") and not force:
                     already_has_slow_xai += 1
                 else:
                     slow_path_samples.append((i, result))
@@ -321,7 +328,7 @@ Do NOT change or question the verdict. Just explain it clearly.
                 self.stats["skipped_no_debate"] += 1
                 # Fast path: check if PhoBERT XAI needed
                 if phobert_generator:
-                    if result.get("phobert_xai"):
+                    if result.get("phobert_xai") and not force:
                         already_has_fast_xai += 1
                     else:
                         fast_path_samples.append((i, result))
@@ -427,7 +434,7 @@ Do NOT change or question the verdict. Just explain it clearly.
 
 async def main_async(args):
     """Async main function."""
-    results_dir = Path(__file__).parent.parent / "results" / "vifactcheck"
+    results_dir = project_root / "results" / "vifactcheck"
     
     # Determine which files to process
     files_to_process = []
@@ -486,7 +493,8 @@ async def main_async(args):
                     file_path,
                     backup=not args.no_backup,
                     concurrency=args.concurrency,
-                    phobert_generator=use_phobert
+                    phobert_generator=use_phobert,
+                    force=args.force
                 )
                 total_stats["files_processed"] += 1
                 total_stats["total_xai_generated"] += stats["xai_generated"]
@@ -556,6 +564,11 @@ def main():
         "--include-phobert",
         action="store_true",
         help="Include PhoBERT XAI for fast path samples in hybrid mode"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force regenerate XAI even for samples that already have XAI"
     )
     
     args = parser.parse_args()
