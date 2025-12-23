@@ -14,62 +14,6 @@ Mục tiêu:
 
 ## Kiến trúc tổng quan
 
-### Flow Diagram (Mermaid)
-
-```mermaid
-flowchart TD
-    subgraph INPUT["📥 INPUT"]
-        A[Claim + Evidence]
-    end
-
-    subgraph MODEL["🤖 PhoBERT Model"]
-        B[3-label Classifier<br/>SUPPORT | REFUTE | NEI]
-    end
-
-    subgraph HYBRID["⚖️ HYBRID DECISION"]
-        C{Confidence ≥ 85%?}
-    end
-
-    subgraph FAST["⚡ FAST PATH"]
-        D[Trust Model<br/>+ LIME XAI]
-    end
-
-    subgraph SLOW["🔥 SLOW PATH - Multi-Agent Debate"]
-        subgraph DEBATORS["👥 DEBATORS"]
-            E1[D1: Support]
-            E2[D2: Refute]
-            E3[D3: NEI]
-        end
-        F[🔄 2 Rounds<br/>Arguments & Rebuttals]
-        G[👨‍⚖️ JUDGE<br/>Final Verdict + Confidence]
-    end
-
-    subgraph OUTPUT["📊 OUTPUT"]
-        H[FINAL VERDICT<br/>SUPPORTED | REFUTED | NEI]
-        I[💡 XAI GENERATOR<br/>• Summary<br/>• Key Evidence<br/>• Reasoning Chain]
-    end
-
-    A --> B
-    B -->|Verdict + Conf| C
-    C -->|YES ≥85%| D
-    C -->|NO <85%| E1 & E2 & E3
-    E1 & E2 & E3 --> F
-    F --> G
-    D --> H
-    G --> H
-    H --> I
-
-    style INPUT fill:#e1f5fe
-    style MODEL fill:#fff3e0
-    style HYBRID fill:#fce4ec
-    style FAST fill:#e8f5e9
-    style SLOW fill:#fff8e1
-    style OUTPUT fill:#f3e5f5
-```
-
-<details>
-<summary>📋 ASCII Version (backup)</summary>
-
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           HYBRID DEBATE PIPELINE                            │
