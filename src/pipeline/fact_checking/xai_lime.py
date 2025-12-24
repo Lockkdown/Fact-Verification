@@ -275,7 +275,8 @@ class PhoBERTLimeXAI:
             words = [re.sub(r'[^\w_]', '', w) for w in words]
 
             stopwords = _load_vietnamese_stopwords()
-            return [w for w in words if w not in stopwords and len(w) > 1]
+            # Keep single-digit numbers (e.g., "5", "7") but filter short non-numeric words
+            return [w for w in words if w not in stopwords and (len(w) > 1 or w.isdigit())]
 
         claim_words = set(normalize_and_segment(claim))
         evidence_words = set(normalize_and_segment(evidence))
@@ -328,8 +329,9 @@ class PhoBERTLimeXAI:
         if claim_years and evidence_years:
             return claim_years[0], evidence_years[0]
 
-        claim_nums = [w for w in claim_conflicts if any(c.isdigit() for c in w) and len(w) >= 2]
-        evidence_nums = [w for w in evidence_conflicts if any(c.isdigit() for c in w) and len(w) >= 2]
+        # Match numbers (including single digits like "5", "7")
+        claim_nums = [w for w in claim_conflicts if any(c.isdigit() for c in w)]
+        evidence_nums = [w for w in evidence_conflicts if any(c.isdigit() for c in w)]
         if claim_nums and evidence_nums:
             return claim_nums[0], evidence_nums[0]
 

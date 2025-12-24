@@ -128,13 +128,22 @@ class DebateXAI:
         # 6. Create debate summary (for additional context)
         debate_summary = self._create_debate_summary(final_verdict, debate_history)
         
+        # Determine reasoning source based on decision path
+        decision_path = getattr(final_verdict, 'decision_path', 'MAJORITY_VOTE')
+        if decision_path == "MAJORITY_VOTE":
+            reasoning_source = "majority_vote"
+        elif "CONSENSUS" in str(decision_path):
+            reasoning_source = "consensus"
+        else:
+            reasoning_source = "debate"
+        
         return {
             "relationship": relationship,
             "natural_explanation": natural_explanation,
             "claim_conflict_word": claim_conflict,
             "evidence_conflict_word": evidence_conflict,
             "confidence": confidence,
-            "reasoning_source": "judge",
+            "reasoning_source": reasoning_source,
             "debate_summary": debate_summary,
             # For compatibility with PhoBERT XAI
             "similarity_score": confidence

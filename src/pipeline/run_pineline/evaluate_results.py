@@ -502,8 +502,24 @@ def compute_round_by_round_accuracy(results: List[Dict[str, Any]]) -> Dict[str, 
             rounds_used = debate_res["metrics"].get("rounds_used", 1)
             rounds_distribution[rounds_used] += 1
         
-        # METHOD 1: Use 'round_metrics' list (Rich data from new logs)
-        if debate_res and "round_metrics" in debate_res:
+        # METHOD 1: Use 'all_rounds_verdicts' (New multi-round format from orchestrator) - Dec 23, 2025
+        if debate_res and "all_rounds_verdicts" in debate_res:
+            all_rounds_verdicts = debate_res["all_rounds_verdicts"]
+            for round_idx, round_data in enumerate(all_rounds_verdicts):
+                r_num = round_idx + 1
+                # Extract verdicts from each debator in this round
+                verdicts = [normalize_label(data.get("verdict", "NEI")) for data in round_data.values()]
+                # Calculate majority vote
+                verdict_counts = Counter(verdicts)
+                majority_v = verdict_counts.most_common(1)[0][0] if verdict_counts else "NEI"
+                
+                round_key = f"round_{r_num}"
+                round_accuracies[round_key]["total"] += 1
+                if majority_v == gold:
+                    round_accuracies[round_key]["correct"] += 1
+                    
+        # METHOD 2: Use 'round_metrics' list (Rich data from new logs) - fallback
+        elif debate_res and "round_metrics" in debate_res:
             for round_data in debate_res["round_metrics"]:
                 r_num = round_data["round_num"]
                 majority_v = normalize_label(round_data.get("majority_verdict", "NEI"))
@@ -513,7 +529,7 @@ def compute_round_by_round_accuracy(results: List[Dict[str, Any]]) -> Dict[str, 
                 if majority_v == gold:
                     round_accuracies[round_key]["correct"] += 1
                     
-        # METHOD 2: Fallback to legacy fields (round_1_verdicts) if round_metrics missing
+        # METHOD 3: Fallback to legacy fields (round_1_verdicts) if round_metrics missing
         elif debate_res and debate_res.get("round_1_verdicts"):
             round_1_verdicts = [normalize_label(v["verdict"]) for v in debate_res["round_1_verdicts"].values()]
             majority_r1 = Counter(round_1_verdicts).most_common(1)[0][0]
@@ -624,61 +640,46 @@ def print_metrics_report(metrics: Dict[str, Any]):
         print(f"  Broken:             {debate['broken']} (model ✓ → final ✗) - {debate['break_rate']:.2f}%")
         print(f"  Kept incorrect:     {debate['kept_incorrect']} (model ✗ → final ✗)")
     
-    # TIER 1: Consensus Scores
-    if metrics.get("consensus_scores"):
-        consensus = metrics["consensus_scores"]
-        print(f"\n🤝 TIER 1 - Consensus Metrics:")
-        print(f"  Round 1 Avg Consensus:    {consensus.get('round_1_avg_consensus', 0):.4f}")
-        print(f"  Final Avg Consensus:      {consensus.get('final_avg_consensus', 0):.4f}")
-        print(f"  Consensus Improvement:    {consensus.get('consensus_improvement', 0):+.4f}")
-        print(f"  Round 1 Unanimous Rate:   {consensus.get('round_1_unanimous_rate', 0):.2%}")
-        print(f"  Final Unanimous Rate:     {consensus.get('final_unanimous_rate', 0):.2%}")
-    
-    # TIER 1: Inter-Agent Agreement
-    if metrics.get("inter_agent_agreement"):
-        agreement = metrics["inter_agent_agreement"]
-        print(f"\n🔗 TIER 1 - Inter-Agent Agreement:")
-        print(f"  Average Pairwise Agreement: {agreement.get('avg_pairwise_agreement', 0):.2%}")
-        if agreement.get("agreement_matrix"):
-            print(f"  Agreement Matrix:")
-            for pair, rate in sorted(agreement["agreement_matrix"].items()):
-                print(f"    {pair:<30}: {rate:.2%}")
-    
-    # TIER 1: Round-by-Round Accuracy
+    # Round-by-Round Accuracy (scope-aligned Dec 2025)
     if metrics.get("round_by_round_accuracy"):
         round_acc = metrics["round_by_round_accuracy"]
-        print(f"\n📊 TIER 1 - Round-by-Round Accuracy:")
-        if "round_1_accuracy" in round_acc:
-            print(f"  Round 1 Majority Vote:    {round_acc['round_1_accuracy']:.2%} ({round_acc['round_1_correct']}/{round_acc['round_1_total']})")
-        if "round_2_accuracy" in round_acc:
-            print(f"  Round 2 Majority Vote:    {round_acc['round_2_accuracy']:.2%} ({round_acc['round_2_correct']}/{round_acc['round_2_total']})")
+        print(f"\n📊 Round-by-Round Accuracy:")
+        # Dynamic multi-round display
+        for i in range(1, 10):  # Support up to 9 rounds
+            key = f"round_{i}_accuracy"
+            if key in round_acc:
+                print(f"  Round {i} Majority Vote:    {round_acc[key]:.2%} ({round_acc.get(f'round_{i}_correct', 0)}/{round_acc.get(f'round_{i}_total', 0)})")
         if "final_accuracy" in round_acc:
             print(f"  Final (Judge):            {round_acc['final_accuracy']:.2%} ({round_acc['final_correct']}/{round_acc['final_total']})")
         if "improvement_r1_to_final" in round_acc:
-            print(f"  Improvement (R1→Final):   {round_acc['improvement_r1_to_final']:+.2%}")
+            imp = round_acc['improvement_r1_to_final']
+            emoji = "📈" if imp > 0 else "📉" if imp < 0 else "➡️"
+            print(f"  {emoji} Improvement (R1→Final): {imp:+.2%}")
     
-    # TIER 2: Model Calibration
+    # Model Calibration (ECE, Brier Score)
     if metrics.get("model_calibration"):
         calib = metrics["model_calibration"]
-        print(f"\n🎯 TIER 2 - Model Calibration (3-Label):")
-        print(f"  Samples analyzed:         {calib.get('n_samples', 0)}")
+        print(f"\n🎯 Model Calibration:")
         
+        # New format: {"model": {...}, "final": {...}}
+        if calib.get("model"):
+            m = calib["model"]
+            print(f"  PhoBERT (pre-debate):")
+            print(f"    ECE:          {m.get('ece', 0):.4f}")
+            print(f"    Brier Score:  {m.get('brier_score', 0):.4f}")
+        
+        if calib.get("final"):
+            f = calib["final"]
+            print(f"  Final (post-debate):")
+            print(f"    ECE:          {f.get('ece', 0):.4f}")
+            print(f"    Brier Score:  {f.get('brier_score', 0):.4f}")
+        
+        # Legacy format support: {"n_samples": ..., "raw": {...}, "calibrated": {...}}
         if calib.get("raw"):
             raw = calib["raw"]
-            print(f"\n  Before Calibration (T=1.0):")
-            print(f"    ECE:                    {raw['ece']:.4f}")
-            print(f"    Brier Score:            {raw['brier']:.4f}")
-            print(f"    Avg Confidence:         {raw['avg_confidence']:.4f}")
-            print(f"    Avg Conf (Correct):     {raw['avg_confidence_correct']:.4f}")
-            print(f"    Avg Conf (Incorrect):   {raw['avg_confidence_incorrect']:.4f}")
-        
-        if calib.get("calibrated") and calib.get("temperature", 1.0) != 1.0:
-            cal = calib["calibrated"]
-            T = calib["temperature"]
-            print(f"\n  After Calibration (T={T:.4f}):")
-            print(f"    ECE:                    {cal['ece']:.4f} ({(cal['ece'] - raw['ece']) / raw['ece']:+.1%})")
-            print(f"    Brier Score:            {cal['brier']:.4f} ({(cal['brier'] - raw['brier']) / raw['brier']:+.1%})")
-            print(f"    Avg Confidence:         {cal['avg_confidence']:.4f}")
+            print(f"  Samples analyzed: {calib.get('n_samples', 0)}")
+            print(f"  ECE:              {raw.get('ece', 0):.4f}")
+            print(f"  Brier Score:      {raw.get('brier', 0):.4f}")
     
     print("\n" + "="*80 + "\n")
 

@@ -18,6 +18,7 @@ Usage:
 import json
 import argparse
 import matplotlib.pyplot as plt
+from typing import Dict, List, Any
 import seaborn as sns
 import numpy as np
 import pandas as pd
@@ -583,6 +584,8 @@ def plot_consensus_progression(consensus_data: dict, split_name: str, output_fil
     """
     TIER 1: Plot consensus scores progression from Round 1 to Final.
     
+    Supports dynamic multi-round (3, 5, 7, unlimited) - Dec 23, 2025.
+    
     Args:
         consensus_data: Consensus metrics dict
         split_name: Split name (Dev/Test) for title
@@ -592,20 +595,38 @@ def plot_consensus_progression(consensus_data: dict, split_name: str, output_fil
         print("⚠️  No consensus data available, skipping consensus progression plot")
         return
     
-    rounds = ['Round 1', 'Final']
-    consensus_scores = [
-        consensus_data.get('round_1_avg_consensus', 0),
-        consensus_data.get('final_avg_consensus', 0)
-    ]
+    # Build rounds dynamically
+    rounds = []
+    consensus_scores = []
     
-    # Insert Round 2 if available
-    if consensus_data.get('round_2_avg_consensus') is not None:
-        rounds.insert(1, 'Round 2')
-        consensus_scores.insert(1, consensus_data['round_2_avg_consensus'])
+    # Add all available rounds (round_1, round_2, round_3, ...) - skip null values
+    round_num = 1
+    while f'round_{round_num}_avg_consensus' in consensus_data:
+        score = consensus_data.get(f'round_{round_num}_avg_consensus')
+        # Skip null/None values to avoid isfinite error (Dec 23, 2025)
+        if score is not None:
+            rounds.append(f'Round {round_num}')
+            consensus_scores.append(float(score))
+        round_num += 1
+    
+    # Fallback: if no round_X_avg_consensus, try old format
+    if not rounds and 'round_1_avg_consensus' in consensus_data:
+        score = consensus_data.get('round_1_avg_consensus', 0)
+        if score is not None:
+            rounds = ['Round 1']
+            consensus_scores = [float(score)]
+    
+    # Add Final
+    final_score = consensus_data.get('final_avg_consensus', 0)
+    rounds.append('Final')
+    consensus_scores.append(float(final_score) if final_score is not None else 0.0)
 
+    # Ensure unanimous_rates are floats (handle None values)
+    r1_rate = consensus_data.get('round_1_unanimous_rate', 0)
+    final_rate = consensus_data.get('final_unanimous_rate', 0)
     unanimous_rates = [
-        consensus_data.get('round_1_unanimous_rate', 0),
-        consensus_data.get('final_unanimous_rate', 0)
+        float(r1_rate) if r1_rate is not None else 0.0,
+        float(final_rate) if final_rate is not None else 0.0
     ]
     
     # Create figure with 2 subplots
@@ -730,6 +751,8 @@ def plot_round_by_round_accuracy(round_accuracy_data: dict, model_accuracy: floa
     """
     TIER 1: Plot accuracy improvement across debate rounds.
     
+    Supports dynamic multi-round (3, 5, 7, unlimited) - Dec 23, 2025.
+    
     Args:
         round_accuracy_data: Round-by-round accuracy dict
         model_accuracy: Baseline model accuracy (pre-debate)
@@ -740,21 +763,24 @@ def plot_round_by_round_accuracy(round_accuracy_data: dict, model_accuracy: floa
         print("⚠️  No round-by-round accuracy data available, skipping round accuracy plot")
         return
     
-    # Build data
+    # Build data - dynamic multi-round support
     rounds = ['Model\n(Baseline)']
     accuracies = [model_accuracy / 100]  # Convert % to decimal
     
-    if 'round_1_accuracy' in round_accuracy_data:
-        rounds.append('Round 1\n(Majority)')
-        accuracies.append(round_accuracy_data['round_1_accuracy'])
-    
-    if 'round_2_accuracy' in round_accuracy_data:
-        rounds.append('Round 2\n(Majority)')
-        accuracies.append(round_accuracy_data['round_2_accuracy'])
+    # Dynamically add rounds from round_X_accuracy keys - skip null values (Dec 23, 2025)
+    round_num = 1
+    while f'round_{round_num}_accuracy' in round_accuracy_data:
+        acc = round_accuracy_data.get(f'round_{round_num}_accuracy')
+        if acc is not None:
+            rounds.append(f'Round {round_num}\n(Majority)')
+            accuracies.append(float(acc))
+        round_num += 1
     
     if 'final_accuracy' in round_accuracy_data:
-        rounds.append('Final\n(Judge)')
-        accuracies.append(round_accuracy_data['final_accuracy'])
+        final_acc = round_accuracy_data.get('final_accuracy')
+        if final_acc is not None:
+            rounds.append('Final\n(Judge)')
+            accuracies.append(float(final_acc))
     
     # Create figure
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -826,8 +852,17 @@ def plot_rounds_distribution(round_accuracy_data: dict, split_name: str, output_
     colors = ['#2ecc71', '#f39c12', '#e74c3c']  # Green, Orange, Red
     explode = []
     
-    # Force display of rounds 1, 2, 3 even if count is 0
-    all_rounds = [1, 2, 3]
+    # Dynamic rounds based on actual data, with minimum of [1, 2] for backward compatibility
+    actual_rounds = set()
+    for key in rounds_dist.keys():
+        try:
+            round_num = int(key)
+            actual_rounds.add(round_num)
+        except (ValueError, TypeError):
+            pass
+    
+    # Ensure at least rounds 1-2 are shown, but include all actual rounds
+    all_rounds = sorted(actual_rounds.union({1, 2}))
     
     for round_num in all_rounds:
         # Get count (handle string/int keys)
@@ -1129,138 +1164,129 @@ def plot_confusion_matrix_comparison(df: pd.DataFrame, split_name: str, output_f
     print(f"📊 Saved CM comparison chart: {output_file}")
 
 
-def generate_all_plots(metrics: dict, results: list, split_name: str, output_dir: Path):
+def generate_all_plots(metrics: Dict[str, Any], results: List[Dict[str, Any]], split_name: str, output_dir: str):
     """
-    Generate all plots for a given split.
+    TIER 1 MASTER: Generate all visualization plots for debate metrics.
     
     Args:
-        metrics: Metrics dictionary
-        results: Raw list of sample results
-        split_name: Split name (dev/test)
+        metrics: Computed metrics dict from evaluate_results.py
+        results: Raw results list 
+        split_name: Name of the split (Dev/Test)
         output_dir: Output directory for plots
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    from pathlib import Path
+    import os
+    import json
     
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n🎨 Generating all plots for {split_name}...")
+    
+    # Model accuracy (from metrics)
+    model_accuracy = metrics.get("model_accuracy", 0.8) * 100  # Convert to percentage
+    
+    # Try to load round_metrics from debate_metrics file (Dec 23, 2025 fix)
+    # Dec 24, 2025: debate_metrics is in metrics/ folder, not charts/ folder
+    metrics_folder = output_path.parent / "metrics"
+    debate_metrics_file = metrics_folder / f"debate_metrics_{split_name.lower()}.json"
+    enhanced_consensus_data = None
+    enhanced_round_accuracy = None
+    
+    if debate_metrics_file.exists():
+        try:
+            with open(debate_metrics_file, 'r', encoding='utf-8') as f:
+                debate_data = json.load(f)
+            
+            samples = debate_data.get('samples', [])
+            if samples:
+                print(f"📊 Using enhanced metrics from debate_metrics file ({len(samples)} samples)")
+                
+                # Compute consensus scores from round_metrics
+                round_consensus = {}
+                round_accuracies = {}
+                
+                for sample in samples:
+                    gold = sample.get('gold_label', '')
+                    round_metrics = sample.get('round_metrics', [])
+                    
+                    for rm in round_metrics:
+                        round_num = rm.get('round_num', 1)
+                        agreement_ratio = rm.get('agreement_ratio', 0)
+                        majority_verdict = rm.get('majority_verdict', 'NEI')
+                        
+                        # Consensus
+                        round_key = f'round_{round_num}'
+                        if round_key not in round_consensus:
+                            round_consensus[round_key] = []
+                        round_consensus[round_key].append(agreement_ratio)
+                        
+                        # Accuracy  
+                        if round_key not in round_accuracies:
+                            round_accuracies[round_key] = {'correct': 0, 'total': 0}
+                        round_accuracies[round_key]['total'] += 1
+                        if majority_verdict == gold:
+                            round_accuracies[round_key]['correct'] += 1
+                
+                # Build enhanced consensus data
+                enhanced_consensus_data = {}
+                for round_key, scores in round_consensus.items():
+                    if scores:
+                        avg_score = sum(scores) / len(scores)
+                        enhanced_consensus_data[f'{round_key}_avg_consensus'] = round(avg_score, 4)
+                        unanimous_rate = sum(1 for s in scores if s == 1.0) / len(scores)
+                        enhanced_consensus_data[f'{round_key}_unanimous_rate'] = round(unanimous_rate, 4)
+                
+                # Add final consensus (same as last round)
+                if round_consensus:
+                    last_round_key = max(round_consensus.keys(), key=lambda x: int(x.split('_')[1]))
+                    enhanced_consensus_data['final_avg_consensus'] = enhanced_consensus_data.get(f'{last_round_key}_avg_consensus', 0)
+                    enhanced_consensus_data['final_unanimous_rate'] = enhanced_consensus_data.get(f'{last_round_key}_unanimous_rate', 0)
+                
+                # Build enhanced round accuracy
+                enhanced_round_accuracy = {}
+                for round_key, counts in round_accuracies.items():
+                    if counts['total'] > 0:
+                        acc = counts['correct'] / counts['total']
+                        enhanced_round_accuracy[f'{round_key}_accuracy'] = round(acc, 4)
+                        enhanced_round_accuracy[f'{round_key}_correct'] = counts['correct']
+                        enhanced_round_accuracy[f'{round_key}_total'] = counts['total']
+                
+                # Add final accuracy (from metrics)
+                if 'final_accuracy' in metrics:
+                    enhanced_round_accuracy['final_accuracy'] = metrics['final_accuracy']
+                    
+        except Exception as e:
+            print(f"⚠️  Could not load debate_metrics file: {e}")
+    else:
+        print(f"⚠️  debate_metrics file not found: {debate_metrics_file}") 
+
     # Convert results to DataFrame
     df = pd.DataFrame(results)
     
-    # === NEW ADVANCED PLOTS (Require raw data) ===
-    
-    # Plot 0: MVP Agent Distribution (XAI)
-    plot_mvp_distribution(df, split_name, output_dir / "mvp_distribution.png")
-    
-    # Plot 0.5: Confusion Matrix Comparison (Model vs Final)
-    plot_confusion_matrix_comparison(df, split_name, output_dir / "confusion_matrix_comparison.png")
-    
-    # === EXISTING PLOTS (Use metrics) ===
+    # === ESSENTIAL PLOTS ONLY (Dec 24, 2025 cleanup) ===
     
     # Plot 1: Confusion Matrix (Final)
     plot_confusion_matrix(
         metrics["final_confusion_matrix"],
         split_name,
-        output_dir / "confusion_matrix_final.png"
+str(output_path / "confusion_matrix_final.png")
     )
     
-    # Plot 2: F1 per Class (Final)
-    plot_f1_per_class(
-        metrics["final_per_class"],
-        split_name,
-        output_dir / "f1_per_class_final.png"
-    )
-    
-    # Plot 3: Precision/Recall per Class (Final)
-    plot_precision_recall_per_class(
-        metrics["final_per_class"],
-        split_name,
-        output_dir / "precision_recall_final.png"
-    )
-    
-    # Plot 3.5: Classification Reports (Model & Final)
-    if metrics.get("model_per_class"):
-        plot_classification_report(
-            metrics["model_per_class"],
-            split_name,
-            output_dir / "classification_report_model.png",
-            title_prefix="Model (PhoBERT)"
-        )
-    
-    plot_classification_report(
-        metrics["final_per_class"],
-        split_name,
-        output_dir / "classification_report_final.png",
-        title_prefix="Final (Debate)"
-    )
-    
-    # Plot 4: Model vs Final Comparison
-    plot_model_vs_final_comparison(
-        metrics,
-        split_name,
-        output_dir / "model_vs_final_comparison.png"
-    )
-    
-    # Plot 5: Debate Impact (if available)
+    # Plot 2: Debate Impact (if available)
     if metrics.get("debate_impact"):
         plot_debate_impact(
             metrics["debate_impact"],
             split_name,
-            output_dir / "debate_impact.png"
+            str(output_path / "debate_impact.png")
         )
     
-    # Plot 6: Debate Rounds Distribution (if available)
-    if metrics.get("debate_rounds_distribution"):
-        plot_debate_rounds_distribution(
-            metrics["debate_rounds_distribution"],
-            split_name,
-            output_dir / "debate_rounds_distribution.png"
-        )
-    
-    # Plot 7: Debator Performance (if available)
+    # Plot 3: Debator Performance (if available)
     if metrics.get("debator_performance"):
         plot_debator_performance(
             metrics["debator_performance"],
             split_name,
-            output_dir / "debator_performance.png"
-        )
-    
-    # TIER 1 Plot 1: Consensus Progression
-    if metrics.get("consensus_scores"):
-        plot_consensus_progression(
-            metrics["consensus_scores"],
-            split_name,
-            output_dir / "tier1_consensus_progression.png"
-        )
-    
-    # TIER 1 Plot 2: Inter-Agent Agreement Matrix
-    if metrics.get("inter_agent_agreement"):
-        plot_inter_agent_agreement_matrix(
-            metrics["inter_agent_agreement"],
-            split_name,
-            output_dir / "tier1_inter_agent_agreement.png"
-        )
-    
-    # TIER 1 Plot 3: Round-by-Round Accuracy
-    if metrics.get("round_by_round_accuracy"):
-        plot_round_by_round_accuracy(
-            metrics["round_by_round_accuracy"],
-            metrics["model_accuracy"],
-            split_name,
-            output_dir / "tier1_round_accuracy.png"
-        )
-    
-    # TIER 1 Plot 4: Adaptive Stop Distribution
-    if metrics.get("round_by_round_accuracy"):
-        plot_rounds_distribution(
-            metrics["round_by_round_accuracy"],
-            split_name,
-            output_dir / "tier1_rounds_distribution.png"
-        )
-    
-    # TIER 2 Plot: Reliability Diagram
-    if metrics.get("model_calibration"):
-        plot_reliability_diagram(
-            metrics["model_calibration"],
-            split_name,
-            output_dir / "tier2_reliability_diagram.png"
+            str(output_path / "debator_performance.png")
         )
     
     print(f"\n✅ All plots saved to: {output_dir}")
@@ -1281,8 +1307,8 @@ def main():
     # Create output directory
     output_dir = Path(args.output_dir)
     
-    # Generate all plots
-    generate_all_plots(metrics, args.split, output_dir)
+    # Generate all plots (pass empty results list since we only have metrics)
+    generate_all_plots(metrics, [], args.split, str(output_dir))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,10 @@ from dataclasses import dataclass
 import logging
 import unicodedata
 
+# Fix for "Event loop is closed" error when using asyncio.run() multiple times
+import nest_asyncio
+nest_asyncio.apply()
+
 # PyVi for word segmentation (MUST match training preprocessing)
 try:
     from pyvi import ViTokenizer
@@ -201,7 +205,10 @@ class ViFactCheckPipeline:
                 "early_stopped": debate_result.early_stopped,
                 "stop_reason": debate_result.stop_reason,
                 "mvp_agent": debate_result.mvp_agent,
-                "debator_agreements": debate_result.debator_agreements
+                "debator_agreements": debate_result.debator_agreements,
+                # New metrics (Dec 2025)
+                "consensus_round": getattr(debate_result, "consensus_round", None),
+                "decision_path": getattr(debate_result, "decision_path", None)
             }
             
             # Store XAI dict (Dec 2025)
