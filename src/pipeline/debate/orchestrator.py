@@ -1,13 +1,17 @@
 """
-Simplified 2-Round Debate Orchestrator.
+Consensus-Based Multi-Round Debate Orchestrator.
 
-Flow:
+Flow (v2.0 - Dec 22, 2025):
 - Round 1: Independent reasoning (đọc & tự phán)
-- Round 2: Debate + final commit (tranh luận & chốt kèo)
-- Judge: Called ONCE after Round 2 to make final decision
+- Round 2...N: Cross-examination (tranh luận dựa trên câu trả lời của agents khác)
+- Dừng khi: 3/3 agents đồng thuận HOẶC đạt max rounds
+- Judge: LLM call để tổng hợp verdict
+
+Note: XAI generation removed from pipeline (Dec 24, 2025)
+      XAI is now only used in demo UI via xai_debate.py
 
 Author: Lockdown
-Date: Dec 01, 2025 (Simplified from 3-round system)
+Date: Dec 22, 2025 (Refactored for true debate)
 """
 
 import json
@@ -26,7 +30,6 @@ from .debator import Debator, GenericDebator, Evidence, DebateArgument
 from .judge import Judge, FinalVerdict, JudgeR2Anchor
 from .llm_client import LLMClient
 from .hybrid_strategy import HybridStrategy
-from .xai_debate import DebateXAI, generate_debate_xai
 
 logger = logging.getLogger(__name__)
 
@@ -193,13 +196,18 @@ class AdaptiveDebateOrchestrator:
         return debators
 
     def _init_judge(self) -> Judge:
-        """Initialize judge từ config."""
+        """Initialize judge từ config.
+        
+        Note: generate_xai=False for experiments (save tokens).
+        For demo UI, create Judge with generate_xai=True.
+        """
         
         judge_config = self.models_config['judge']
         
         return Judge(
             model_config=judge_config,
-            llm_client=self.llm_client
+            llm_client=self.llm_client,
+            generate_xai=False  # XAI disabled for experiments, enable for demo UI
         )
     
     def debate(
@@ -232,41 +240,62 @@ class AdaptiveDebateOrchestrator:
         
         round_num = 1
         debate_history = []
-        # NOTE: Judge no longer provides mid-debate guidance in 2-round system
+        stop_reason = ""
+        max_rounds = self.debate_config.get('max_rounds')  # None = unlimited
+        stop_on_consensus = self.debate_config.get('stop_on_consensus', True)
+        max_safety_rounds = self.debate_config.get('max_safety_rounds', 15)
         
-        while round_num <= self.debate_config['max_rounds']:
-            logger.info(f"\n--- ROUND {round_num} ---")
+        # Metrics tracking (Dec 2025)
+        consensus_round = None  # Round at which consensus was first reached
+        tokens_per_round = []  # Tokens used per round
+        
+        # Early stop tracking (Dec 24, 2025 - align with scope)
+        # Rule: stop when Unanimous_r AND majority_label_r == majority_label_{r-1}
+        previous_majority_label = None
+        
+        # Determine effective max rounds
+        # Fixed mode (3/5/7): use max_rounds, ignore consensus
+        # Unlimited mode (null): use max_safety_rounds, stop on consensus
+        if max_rounds is None:
+            effective_max = max_safety_rounds
+            mode_str = f"UNLIMITED (max safety={max_safety_rounds})"
+        else:
+            effective_max = max_rounds
+            mode_str = f"FIXED {max_rounds} rounds"
+        
+        logger.info(f"📋 Debate Mode: {mode_str}, stop_on_consensus={stop_on_consensus}")
+        
+        # Removed confirmation round mechanism (Dec 23, 2025)
+        
+        # Main debate loop
+        while True:
+            max_str = str(max_rounds) if max_rounds else "∞"
+            logger.info(f"\n--- ROUND {round_num}/{max_str} (DEBATE) ---")
             
-            # Get arguments từ tất cả debators
+            # Get arguments from all debators
             round_arguments = []
+            prev_args = debate_history[-1] if debate_history else None
             
-            for i, debator in enumerate(self.debators):
+            for debator in self.debators:
                 try:
-                    # Pass previous round arguments nếu có
-                    prev_args = debate_history[-1] if debate_history else None
-                    
                     argument = debator.argue(
                         claim=claim,
                         evidences=evidences,
                         round_num=round_num,
                         previous_arguments=prev_args,
                         model_verdict=model_verdict,
-                        model_confidence=model_confidence
+                        model_confidence=model_confidence,
+                        max_rounds=max_rounds,
                     )
-                    
                     round_arguments.append(argument)
-                    
-                    # No delay needed - OpenRouter paid tier handles concurrent requests
-                    # Async method runs all debators in parallel without delays
                     
                 except Exception as e:
                     logger.error(f"Error from {debator.name}: {e}")
-                    # Add fallback argument
                     round_arguments.append(DebateArgument(
                         debator_name=debator.name,
                         role=debator.role,
                         round_num=round_num,
-                        verdict="NOT_ENOUGH_INFO",
+                        verdict="NEI",
                         confidence=0.5,
                         reasoning=f"Error: {str(e)}",
                         key_points=["Error occurred"],
@@ -278,96 +307,178 @@ class AdaptiveDebateOrchestrator:
             
             # Log round summary
             self._log_round_summary(round_num, round_arguments)
-
-            if progress_cb:
-                try:
-                    counts: Dict[str, int] = {}
-                    for a in round_arguments:
-                        v = (a.verdict or "").upper()
-                        counts[v] = counts.get(v, 0) + 1
-                    progress_cb(
-                        "ROUND_DONE",
-                        {
-                            "round": round_num,
-                            "vote_counts": counts,
-                        },
-                    )
-                except Exception:
-                    pass
             
-            # Check early stopping conditions
-            should_stop, stop_reason = self._check_early_stop(
-                round_arguments, 
-                debate_history, 
-                round_num
-            )
+            # Check for consensus with stability (Dec 24, 2025 - align with scope)
+            # Rule: stop when Unanimous_r AND (r >= 2) AND majority_label_r == majority_label_{r-1}
+            has_unanimous, current_majority_label = self._check_unanimous_and_majority(round_arguments)
             
-            if should_stop:
-                logger.info(f"\n✅ Early stop triggered: {stop_reason}")
-                # For Evaluation on ViFactCheck: ALWAYS proceed to Judge
-                # We break the debate loop, but let the flow continue to Judge deliberation
-                break
+            # Check stability condition
+            is_stable = (previous_majority_label is not None and 
+                        current_majority_label == previous_majority_label)
             
-            if round_num >= self.debate_config['max_rounds']:
-                logger.info(f"\n⚠️ Reached max rounds ({self.debate_config['max_rounds']})")
+            # Full early stop condition: unanimous + stable (r >= 2 implicit via is_stable)
+            should_early_stop = has_unanimous and is_stable
+            
+            if has_unanimous:
+                # Track first consensus round (for metrics)
+                if consensus_round is None:
+                    consensus_round = round_num
+                
+                if stop_on_consensus:
+                    if should_early_stop:
+                        # Full condition met: unanimous + stable
+                        stop_reason = "unanimous_stable_consensus"
+                        logger.info(f"\n✅ Stable consensus at round {round_num}: {current_majority_label} (same as R{round_num-1})")
+                        break
+                    else:
+                        # Unanimous but not stable yet (R1 or label changed)
+                        logger.info(f"\n📊 Unanimous at R{round_num}: {current_majority_label} (need stability confirmation)")
+                else:
+                    # Fixed mode: log consensus but continue
+                    logger.info(f"\n📊 Consensus at round {round_num}: {current_majority_label} (continuing to round {effective_max})")
+            
+            # Update previous majority for next round
+            previous_majority_label = current_majority_label
+            
+            # Check max rounds limit
+            if round_num >= effective_max:
+                if max_rounds is None:
+                    logger.info(f"\n⚠️ Reached safety limit ({effective_max}) without consensus")
+                else:
+                    logger.info(f"\n✅ Completed all {effective_max} fixed rounds")
                 stop_reason = "max_rounds_reached"
                 break
             
-            # No delay needed between rounds for paid tier
-            
             round_num += 1
         
-        # Judge makes final verdict (only when no unanimous consensus)
-        logger.info(f"\n--- JUDGE DELIBERATION ---")
+        # Final verdict: use majority vote (align with scope - Dec 24, 2025)
+        logger.info(f"\n--- FINAL VERDICT (Majority Vote) ---")
+        final_verdict = self._majority_vote(debate_history, stop_reason)
         
-        # Log model verdict if provided
-        if model_verdict and model_confidence:
-            logger.info(f"Model verdict: {model_verdict} (confidence: {model_confidence:.2f})")
-        
-        # No delay needed before judge
-        
-        final_verdict = self.judge.decide(
-            claim=claim,
-            debate_history=debate_history,
-            early_stopped=(stop_reason != "max_rounds_reached"),
-            stop_reason=stop_reason,
-            model_verdict=model_verdict,
-            model_confidence=model_confidence,
-            evidences=evidences
-        )
+        # Add metrics to final_verdict
+        final_verdict.consensus_round = consensus_round
         
         # Log final verdict
         self._log_final_verdict(final_verdict)
         
         return final_verdict
     
-    def _check_early_stop(
+    def _check_unanimous_and_majority(
         self,
-        round_arguments: List[DebateArgument],
-        debate_history: List[List[DebateArgument]],
-        round_num: int
+        round_arguments: List[DebateArgument]
     ) -> tuple[bool, str]:
         """
-        Check early stopping conditions.
-        FORCE DISABLED for Research/Reporting purposes (Paper Mode).
-        We want to run full rounds to measure convergence and stability.
-        """
+        Check unanimous agreement and compute majority label.
         
-        # RESEARCH MODE: Always return False to force full debate rounds
-        return False, "research_mode_force_full_rounds"
-
-        # ORIGINAL LOGIC (Commented out for now)
-        # # 1. UNANIMOUS AGREEMENT (3/3 agree)
-        # verdicts = [arg.verdict for arg in round_arguments]
-        # if len(set(verdicts)) == 1:
-        #     return True, "unanimous_agreement"
+        Returns:
+            (is_unanimous, majority_label)
+            - is_unanimous: True if 3/3 agree
+            - majority_label: the majority verdict (always computed for stability tracking)
+        """
+        verdicts = [arg.verdict for arg in round_arguments]
+        verdict_counts = Counter(verdicts)
+        
+        # Majority label (most common verdict)
+        majority_label = verdict_counts.most_common(1)[0][0]
+        
+        # Check 3/3 unanimous agreement
+        if len(set(verdicts)) == 1:
+            logger.info(f"✅ UNANIMOUS: All {len(verdicts)} agents agree on {majority_label}")
+            return True, majority_label
+        
+        # No unanimous - log current distribution
+        logger.info(f"No unanimous yet: {dict(verdict_counts)} (majority: {majority_label})")
+        return False, majority_label
+    
+    def _majority_vote(
+        self,
+        debate_history: List[List[DebateArgument]],
+        stop_reason: str
+    ) -> FinalVerdict:
+        """
+        Simple majority vote from final round (NO LLM call).
+        This replaces the old Judge LLM call.
+        
+        Special case: If 1-1-1 (no majority), return NEI.
+        
+        Args:
+            debate_history: All rounds of debate
+            stop_reason: Why debate stopped
             
-        # # 2. STABLE MAJORITY
-        # if len(debate_history) >= 2:
-        #     # ... (logic omitted)
-        #     pass
-
-        # return False, ""
+        Returns:
+            FinalVerdict based on majority vote
+        """
+        final_round = debate_history[-1]
+        total_agents = len(final_round)
+        
+        # Count verdicts
+        verdict_counts = Counter([arg.verdict for arg in final_round])
+        
+        # Get majority verdict
+        majority_verdict, majority_count = verdict_counts.most_common(1)[0]
+        
+        # Handle 1-1-1 tie (no majority) -> Return NEI
+        if majority_count == 1 and len(verdict_counts) == total_agents:
+            logger.info(f"\u26a0\ufe0f No majority (1-1-1 tie) - defaulting to NEI")
+            majority_verdict = "NEI"
+            majority_count = 0
+            avg_confidence = 0.5
+            reasoning_summary = f"No majority consensus after {len(debate_history)} rounds. All 3 agents disagree (1-1-1). Defaulting to NEI."
+        else:
+            # Normal majority case (2-1 or 3-0)
+            majority_confidences = [arg.confidence for arg in final_round if arg.verdict == majority_verdict]
+            avg_confidence = sum(majority_confidences) / len(majority_confidences)
+            majority_reasonings = [arg.reasoning for arg in final_round if arg.verdict == majority_verdict]
+            reasoning_summary = f"Majority vote ({majority_count}/{total_agents}): {majority_reasonings[0][:200]}..."
+        
+        # Build round_1_verdicts
+        round_1_verdicts = {}
+        if len(debate_history) > 0:
+            for arg in debate_history[0]:
+                round_1_verdicts[arg.debator_name] = {
+                    "verdict": arg.verdict,
+                    "confidence": arg.confidence,
+                    "reasoning": arg.reasoning,
+                    "role": arg.role
+                }
+        
+        # Build all_rounds_verdicts (Dec 24, 2025 - include debate interaction fields)
+        all_rounds_verdicts = []
+        for round_args in debate_history:
+            round_data = {}
+            for arg in round_args:
+                round_data[arg.debator_name] = {
+                    "verdict": arg.verdict,
+                    "confidence": arg.confidence,
+                    "reasoning": arg.reasoning,
+                    "role": arg.role,
+                    # XAI fields for report visualization
+                    "key_points": arg.key_points or [],
+                    "disagree_with": arg.disagree_with or [],
+                    "disagree_reason": arg.disagree_reason or "",
+                    "agree_with": arg.agree_with or [],
+                    "changed": arg.changed or False,
+                    "change_reason": arg.change_reason or ""
+                }
+            all_rounds_verdicts.append(round_data)
+        
+        logger.info(f"Majority vote result: {majority_verdict} ({majority_count}/{total_agents}, conf={avg_confidence:.2f})")
+        
+        return FinalVerdict(
+            verdict=majority_verdict,
+            confidence=avg_confidence,
+            reasoning=reasoning_summary,
+            evidence_summary="",
+            rounds_used=len(debate_history),
+            debator_agreements=dict(verdict_counts),
+            early_stopped=(stop_reason == "unanimous_consensus"),
+            stop_reason=stop_reason,
+            mvp_agent="Majority",
+            best_quote_from="Majority",
+            decision_path="MAJORITY_VOTE",
+            round_1_verdicts=round_1_verdicts,
+            all_rounds_verdicts=all_rounds_verdicts
+        )
 
     def _create_unanimous_verdict(
         self,
@@ -406,7 +517,7 @@ class AdaptiveDebateOrchestrator:
                     "role": arg.role
                 }
         
-        # All rounds verdicts for metrics visualization
+        # All rounds verdicts for metrics visualization (Dec 24, 2025 - include XAI fields)
         all_rounds_verdicts = []
         for round_args in debate_history:
             round_data = {}
@@ -415,7 +526,14 @@ class AdaptiveDebateOrchestrator:
                     "verdict": arg.verdict,
                     "confidence": arg.confidence,
                     "reasoning": arg.reasoning,
-                    "role": arg.role
+                    "role": arg.role,
+                    # XAI fields for report visualization
+                    "key_points": arg.key_points or [],
+                    "disagree_with": arg.disagree_with or [],
+                    "disagree_reason": arg.disagree_reason or "",
+                    "agree_with": arg.agree_with or [],
+                    "changed": arg.changed or False,
+                    "change_reason": arg.change_reason or ""
                 }
             all_rounds_verdicts.append(round_data)
 
@@ -575,19 +693,40 @@ class AdaptiveDebateOrchestrator:
         
         round_num = 1
         debate_history = []
-        # NOTE: Judge no longer provides mid-debate guidance in 2-round system
+        stop_reason = ""
+        max_rounds = self.debate_config.get('max_rounds')  # None = unlimited
+        stop_on_consensus = self.debate_config.get('stop_on_consensus', True)
+        max_safety_rounds = self.debate_config.get('max_safety_rounds', 15)
+        
+        # Metrics tracking (Dec 2025)
+        consensus_round = None  # Round at which consensus was first reached
+        
+        # Early stop tracking (Dec 24, 2025 - align with scope)
+        # Rule: stop when Unanimous_r AND majority_label_r == majority_label_{r-1}
+        previous_majority_label = None
+        
+        # Determine effective max rounds
+        if max_rounds is None:
+            effective_max = max_safety_rounds
+            mode_str = f"UNLIMITED (max safety={max_safety_rounds})"
+        else:
+            effective_max = max_rounds
+            mode_str = f"FIXED {max_rounds} rounds"
+        
+        logger.info(f"📋 Debate Mode: {mode_str}, stop_on_consensus={stop_on_consensus}")
         
         # Main debate loop
-        while round_num <= self.debate_config['max_rounds']:
-            logger.info(f"\n--- ROUND {round_num} (ASYNC) ---")
+        while True:
+            max_str = str(max_rounds) if max_rounds else "∞"
+            logger.info(f"\n--- ROUND {round_num}/{max_str} (ASYNC) ---")
 
             if progress_cb:
                 try:
-                    progress_cb("ROUND_START", {"round": round_num})
+                    progress_cb("ROUND_START", {"round": round_num, "max_rounds": max_rounds or 'unlimited'})
                 except Exception:
                     pass
             
-            # Get arguments từ tất cả debators CONCURRENTLY
+            # Get arguments from all debators CONCURRENTLY
             prev_args = debate_history[-1] if debate_history else None
             
             # Create tasks for all debators
@@ -599,8 +738,8 @@ class AdaptiveDebateOrchestrator:
                     round_num=round_num,
                     previous_arguments=prev_args,
                     model_verdict=model_verdict,
-                    model_confidence=model_confidence
-                    # NOTE: judge_reasoning removed - no mid-debate guidance in 2-round system
+                    model_confidence=model_confidence,
+                    max_rounds=max_rounds
                 )
                 tasks.append(task)
             
@@ -613,12 +752,11 @@ class AdaptiveDebateOrchestrator:
                 for i, result in enumerate(round_arguments):
                     if isinstance(result, Exception):
                         logger.error(f"Error from {self.debators[i].name}: {result}")
-                        # Add fallback argument
                         clean_arguments.append(DebateArgument(
                             debator_name=self.debators[i].name,
                             role=self.debators[i].role,
                             round_num=round_num,
-                            verdict="NOT_ENOUGH_INFO",
+                            verdict="NEI",
                             confidence=0.5,
                             reasoning=f"Error: {str(result)}",
                             key_points=["Error occurred"],
@@ -631,13 +769,12 @@ class AdaptiveDebateOrchestrator:
                 
             except Exception as e:
                 logger.error(f"Fatal error in async debate round: {e}")
-                # Fallback to all NOT_ENOUGH_INFO
                 round_arguments = [
                     DebateArgument(
                         debator_name=debator.name,
                         role=debator.role,
                         round_num=round_num,
-                        verdict="NOT_ENOUGH_INFO",
+                        verdict="NEI",
                         confidence=0.5,
                         reasoning=f"Fatal error: {str(e)}",
                         key_points=["Error occurred"],
@@ -650,62 +787,76 @@ class AdaptiveDebateOrchestrator:
             
             # Log round summary
             self._log_round_summary(round_num, round_arguments)
+
+            if progress_cb:
+                try:
+                    counts = {}
+                    for arg in round_arguments:
+                        v = (arg.verdict or "").upper()
+                        counts[v] = counts.get(v, 0) + 1
+                    progress_cb("ROUND_DONE", {"round": round_num, "vote_counts": counts})
+                except Exception:
+                    pass
             
-            # Check early stopping conditions
-            should_stop, stop_reason = self._check_early_stop(
-                round_arguments, 
-                debate_history, 
-                round_num
-            )
+            # Check for consensus with stability (Dec 24, 2025 - align with scope)
+            # Rule: stop when Unanimous_r AND (r >= 2) AND majority_label_r == majority_label_{r-1}
+            has_unanimous, current_majority_label = self._check_unanimous_and_majority(round_arguments)
             
-            if should_stop:
-                logger.info(f"\n✅ Early stop triggered: {stop_reason}")
-                # For Evaluation: ALWAYS proceed to Judge
-                break
+            # Check stability condition
+            is_stable = (previous_majority_label is not None and 
+                        current_majority_label == previous_majority_label)
             
-            if round_num >= self.debate_config['max_rounds']:
-                logger.info(f"\n⚠️ Reached max rounds ({self.debate_config['max_rounds']})")
+            # Full early stop condition: unanimous + stable (r >= 2 implicit via is_stable)
+            should_early_stop = has_unanimous and is_stable
+            
+            if has_unanimous:
+                # Track first consensus round (for metrics)
+                if consensus_round is None:
+                    consensus_round = round_num
+                
+                if stop_on_consensus:
+                    if should_early_stop:
+                        # Full condition met: unanimous + stable
+                        stop_reason = "unanimous_stable_consensus"
+                        logger.info(f"\n✅ Stable consensus at round {round_num}: {current_majority_label} (same as R{round_num-1})")
+                        break
+                    else:
+                        # Unanimous but not stable yet (R1 or label changed)
+                        logger.info(f"\n📊 Unanimous at R{round_num}: {current_majority_label} (need stability confirmation)")
+                else:
+                    # Fixed mode: log consensus but continue
+                    logger.info(f"\n📊 Consensus at round {round_num}: {current_majority_label} (continuing to round {effective_max})")
+            
+            # Update previous majority for next round
+            previous_majority_label = current_majority_label
+            
+            # Check max rounds limit
+            if round_num >= effective_max:
+                if max_rounds is None:
+                    logger.info(f"\n⚠️ Reached safety limit ({effective_max}) without consensus")
+                else:
+                    logger.info(f"\n✅ Completed all {effective_max} fixed rounds")
                 stop_reason = "max_rounds_reached"
                 break
             
-            # NOTE: No mid-debate Judge guidance in 2-round system
-            # Judge only runs ONCE after Round 2
-            
             round_num += 1
         
-        # Judge makes final verdict (only when no unanimous consensus)
-        logger.info(f"\n--- JUDGE DELIBERATION (ASYNC) ---")
-
-        if progress_cb:
-            try:
-                progress_cb("JUDGE_START", {})
-            except Exception:
-                pass
+        # Final verdict: use majority vote (align with scope - Dec 24, 2025)
+        logger.info(f"\n--- FINAL VERDICT (Majority Vote) ---")
+        final_verdict = self._majority_vote(debate_history, stop_reason)
         
-        # Log model verdict if provided
-        if model_verdict and model_confidence:
-            logger.info(f"Model verdict: {model_verdict} (confidence: {model_confidence:.2f})")
-        
-        # Judge makes final decision based on R1 + R2 outputs
-        final_verdict = await self.judge.decide_async(
-            claim=claim,
-            debate_history=debate_history,
-            early_stopped=(stop_reason != "max_rounds_reached"),
-            stop_reason=stop_reason,
-            model_verdict=model_verdict,
-            model_confidence=model_confidence,
-            evidences=evidences
-        )
+        # Add metrics to final_verdict
+        final_verdict.consensus_round = consensus_round
 
         if progress_cb:
             try:
                 progress_cb(
-                    "JUDGE_DONE",
+                    "DEBATE_DONE",
                     {
-                        "verdict": getattr(final_verdict, "verdict", None),
-                        "confidence": getattr(final_verdict, "confidence", None),
-                        "rounds_used": getattr(final_verdict, "rounds_used", None),
-                        "stop_reason": getattr(final_verdict, "stop_reason", None),
+                        "verdict": final_verdict.verdict,
+                        "confidence": final_verdict.confidence,
+                        "rounds_used": final_verdict.rounds_used,
+                        "stop_reason": final_verdict.stop_reason,
                     },
                 )
             except Exception:
@@ -738,17 +889,6 @@ class AdaptiveDebateOrchestrator:
             final_verdict.hybrid_source = "DEBATE"
             final_verdict.hybrid_threshold = self.hybrid_threshold
             final_verdict.model_confidence_used = model_confidence
-        
-        # Generate XAI (Dec 2025)
-        evidence_text = " ".join([e.text for e in evidences]) if evidences else ""
-        xai_dict = generate_debate_xai(
-            claim=claim,
-            evidence=evidence_text,
-            final_verdict=final_verdict,
-            debate_history=debate_history
-        )
-        # Store XAI in final_verdict for downstream use
-        final_verdict.xai_dict = xai_dict
         
         # Log final verdict
         self._log_final_verdict(final_verdict)

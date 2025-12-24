@@ -47,15 +47,245 @@ if str(project_root) not in sys.path:
 from src.pipeline.run_pineline.config import PipelineConfig
 from src.pipeline.run_pineline.article_pipeline import ViFactCheckPipeline
 from src.pipeline.debate.debate_metrics import DebateMetricsTracker, DebateSampleMetrics, RoundMetrics
-from src.pipeline.debate.xai_metrics import (
-    XAISampleMetrics, DebateXAIMetrics,
-    calculate_debate_metrics,
-    generate_xai_report
-)
 import matplotlib.pyplot as plt
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# DEBATE CONFIG MANAGEMENT (Dec 2025 - Consensus-Based)
+# ============================================================================
+
+def update_debate_config(max_rounds: Optional[int], fixed_mode: bool = False) -> None:
+    """Update debate_config.json with max_rounds and stop_on_consensus.
+    
+    Logic (Dec 24, 2025 - align with scope):
+    - Fixed mode: stop_on_consensus=False (chạy đủ K rounds)
+    - EarlyStop mode: stop_on_consensus=True (dừng khi unanimous+stable)
+    
+    Args:
+        max_rounds: Max rounds limit, or None for unlimited (15)
+        fixed_mode: If True, disable early stopping (run full K rounds)
+    """
+    config_path = project_root / 'config' / 'debate' / 'debate_config.json'
+    
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    
+    config['max_rounds'] = max_rounds
+    config['stop_on_consensus'] = not fixed_mode  # False for fixed, True for earlystop
+    
+    if fixed_mode:
+        mode_str = f"FIXED {max_rounds} rounds (no early stop)"
+    elif max_rounds is None:
+        mode_str = "EARLYSTOP (max safety=15, stop on unanimous+stable)"
+    else:
+        mode_str = f"EARLYSTOP max {max_rounds} rounds (stop on unanimous+stable)"
+    
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"📝 Updated debate_config.json: {mode_str}")
+
+
+def parse_max_rounds_arg(max_rounds_str: str) -> Optional[int]:
+    """Parse max_rounds argument to int or None."""
+    if max_rounds_str.lower() in ['unlimited', 'none', 'inf']:
+        return None
+    return int(max_rounds_str)
+
+
+def analyze_debate_metrics(results: List[Dict[str, Any]], max_rounds: Optional[int] = None) -> Dict[str, Any]:
+    """Analyze debate metrics from results.
+    
+    Args:
+        results: List of result dicts from pipeline
+        max_rounds: Max rounds config (for calculating hit_cap_rate)
+    
+    Returns:
+        Dict with:
+        - avg_rounds_used: Average rounds used per sample
+        - hit_cap_rate: % samples that hit max rounds (chạm trần)
+        - early_stop_rate: % samples that stopped early (dừng sớm)
+        - consensus_rate_per_round: {round: % samples reaching consensus at this round}
+        - error_analysis: {correct_consensus, wrong_consensus, no_consensus}
+    """
+    consensus_rounds = []
+    rounds_used_list = []
+    hit_cap_count = 0
+    early_stop_count = 0
+    error_counts = {"correct_consensus": 0, "wrong_consensus": 0, "no_consensus": 0}
+    total_debate_samples = 0
+    
+    for r in results:
+        if not r.get("debate_metrics"):
+            continue
+            
+        total_debate_samples += 1
+        metrics = r["debate_metrics"]
+        consensus_round = metrics.get("consensus_round")
+        rounds_used = metrics.get("rounds_used", 0)
+        stop_reason = metrics.get("stop_reason", "")
+        early_stopped = metrics.get("early_stopped", False)
+        
+        # Track rounds used
+        if rounds_used:
+            rounds_used_list.append(rounds_used)
+        
+        # Track hit_cap vs early_stop
+        if stop_reason == "max_rounds_reached":
+            hit_cap_count += 1
+        elif early_stopped or consensus_round is not None:
+            early_stop_count += 1
+        
+        # Track consensus round
+        if consensus_round is not None:
+            consensus_rounds.append(consensus_round)
+        
+        # Error analysis: compare final_verdict with ground_truth
+        final_verdict = r.get("final_verdict", "").upper()
+        ground_truth = r.get("label", "").upper()
+        
+        # Normalize labels
+        label_map = {"SUPPORT": "SUPPORTED", "REFUTE": "REFUTED", "SUPPORTS": "SUPPORTED", "REFUTES": "REFUTED"}
+        final_verdict = label_map.get(final_verdict, final_verdict)
+        ground_truth = label_map.get(ground_truth, ground_truth)
+        
+        is_correct = final_verdict == ground_truth
+        has_consensus = consensus_round is not None
+        
+        if has_consensus and is_correct:
+            error_counts["correct_consensus"] += 1
+        elif has_consensus and not is_correct:
+            error_counts["wrong_consensus"] += 1
+        else:
+            error_counts["no_consensus"] += 1
+    
+    # Calculate consensus rate per round
+    consensus_rate_per_round = {}
+    if consensus_rounds:
+        from collections import Counter
+        round_counts = Counter(consensus_rounds)
+        for round_num, count in sorted(round_counts.items()):
+            consensus_rate_per_round[round_num] = count / total_debate_samples if total_debate_samples > 0 else 0
+    
+    # Calculate key metrics
+    avg_rounds_used = sum(rounds_used_list) / len(rounds_used_list) if rounds_used_list else 0
+    hit_cap_rate = hit_cap_count / total_debate_samples if total_debate_samples > 0 else 0
+    early_stop_rate = early_stop_count / total_debate_samples if total_debate_samples > 0 else 0
+    avg_rounds_to_consensus = sum(consensus_rounds) / len(consensus_rounds) if consensus_rounds else None
+    
+    return {
+        "total_debate_samples": total_debate_samples,
+        # NEW: 3 key metrics for paper
+        "avg_rounds_used": avg_rounds_used,
+        "hit_cap_rate": hit_cap_rate,
+        "early_stop_rate": early_stop_rate,
+        # Existing metrics
+        "consensus_rate_per_round": consensus_rate_per_round,
+        "avg_rounds_to_consensus": avg_rounds_to_consensus,
+        "samples_with_consensus": len(consensus_rounds),
+        "consensus_rate_total": len(consensus_rounds) / total_debate_samples if total_debate_samples > 0 else 0,
+        "error_analysis": error_counts
+    }
+
+
+def generate_comparison_report(
+    all_experiment_results: Dict[str, Dict[str, Any]],
+    output_dir: Path,
+    debate_mode: str
+) -> Path:
+    """Generate a comparison report across all max_rounds configs.
+    
+    Args:
+        all_experiment_results: {config_name: {split: results_data}}
+        output_dir: Base output directory
+        debate_mode: "full_debate" or "hybrid_debate"
+    
+    Returns:
+        Path to saved report file
+    """
+    report_dir = output_dir / "comparison_report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Build comparison table with debate metrics
+    comparison_data = []
+    for config_name, splits_data in all_experiment_results.items():
+        for split, results in splits_data.items():
+            # Analyze debate metrics if results available
+            debate_analysis = {}
+            if results.get("results"):
+                debate_analysis = analyze_debate_metrics(results["results"])
+            
+            comparison_data.append({
+                "max_rounds": config_name,
+                "split": split,
+                "debate_mode": debate_mode,
+                "model_accuracy": results.get("model_accuracy", 0),
+                "final_accuracy": results.get("final_accuracy", 0),
+                "improvement": results.get("final_accuracy", 0) - results.get("model_accuracy", 0),
+                "total_samples": results.get("total_samples", 0),
+                "avg_time_per_sample": results.get("avg_per_sample", 0),
+                # KEY METRICS for paper (Dec 2025)
+                "avg_rounds_used": debate_analysis.get("avg_rounds_used", 0),
+                "hit_cap_rate": debate_analysis.get("hit_cap_rate", 0),
+                "early_stop_rate": debate_analysis.get("early_stop_rate", 0),
+                # Consensus metrics
+                "consensus_rate": debate_analysis.get("consensus_rate_total", 0),
+                "avg_rounds_to_consensus": debate_analysis.get("avg_rounds_to_consensus"),
+                "consensus_rate_per_round": debate_analysis.get("consensus_rate_per_round", {}),
+                "error_analysis": debate_analysis.get("error_analysis", {}),
+            })
+    
+    # Save as JSON
+    report_file = report_dir / f"comparison_{debate_mode}.json"
+    with open(report_file, 'w', encoding='utf-8') as f:
+        json.dump(comparison_data, f, indent=2, ensure_ascii=False)
+    
+    # Print comparison table (paper format)
+    logger.info("\n" + "="*140)
+    logger.info(f"COMPARISON REPORT - {debate_mode.upper()}".center(140))
+    logger.info("="*140)
+    logger.info(f"{'Config':<12} {'Split':<6} {'Acc':<7} {'F1':<7} {'AvgRnds':<8} {'HitCap%':<9} {'Early%':<8} {'Consens%':<10} {'CorrectC':<9} {'WrongC':<8}")
+    logger.info("-"*140)
+    
+    for row in comparison_data:
+        error = row.get("error_analysis", {})
+        logger.info(
+            f"{row['max_rounds']:<12} "
+            f"{row['split']:<6} "
+            f"{row['final_accuracy']:.1%}  "
+            f"{'--':<7} "  # F1 placeholder - computed separately
+            f"{row['avg_rounds_used']:.2f}    "
+            f"{row['hit_cap_rate']:.1%}     "
+            f"{row['early_stop_rate']:.1%}   "
+            f"{row['consensus_rate']:.1%}      "
+            f"{error.get('correct_consensus', 0):<9} "
+            f"{error.get('wrong_consensus', 0):<8}"
+        )
+    
+    logger.info("="*140)
+    
+    # Print key metrics summary
+    logger.info("\n📊 KEY DEBATE METRICS:")
+    for row in comparison_data:
+        logger.info(f"  {row['max_rounds']} ({row['split']}):")
+        logger.info(f"    - avg_rounds_used: {row['avg_rounds_used']:.2f}")
+        logger.info(f"    - hit_cap_rate: {row['hit_cap_rate']:.1%} (chạm trần)")
+        logger.info(f"    - early_stop_rate: {row['early_stop_rate']:.1%} (dừng sớm)")
+    
+    # Print consensus rate per round details
+    logger.info("\n📊 CONSENSUS RATE PER ROUND:")
+    for row in comparison_data:
+        if row.get("consensus_rate_per_round"):
+            logger.info(f"  {row['max_rounds']} ({row['split']}):")
+            for round_num, rate in row["consensus_rate_per_round"].items():
+                logger.info(f"    Round {round_num}: {rate:.1%}")
+    
+    logger.info(f"\n📊 Report saved to: {report_file}")
+    
+    return report_file
 
 
 # ============================================================================
@@ -260,6 +490,21 @@ def _build_result(sample: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, A
     }
     model_verdict = verdict_map.get(model_verdict, "NOT_ENOUGH_INFO")
     final_verdict = verdict_map.get(final_verdict, "NOT_ENOUGH_INFO")
+
+    # Display-normalized labels for consistent reporting (SUPPORTED/REFUTED/NEI)
+    def _to_debate_label(label: str) -> str:
+        if not label:
+            return "NEI"
+        v = str(label).upper().strip()
+        if v in ["SUPPORT", "SUPPORTS", "SUPPORTED", "0"]:
+            return "SUPPORTED"
+        if v in ["REFUTE", "REFUTES", "REFUTED", "1"]:
+            return "REFUTED"
+        return "NEI"
+
+    gold_label_norm = _to_debate_label(sample.get("gold_label", ""))
+    model_verdict_norm = _to_debate_label(model_verdict)
+    final_verdict_norm = _to_debate_label(final_verdict)
     
     # Check correctness
     model_correct = (model_verdict == sample["gold_label"])
@@ -270,8 +515,11 @@ def _build_result(sample: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, A
         "statement": sample["statement"],
         "evidence": sample["evidence"],  # Gold evidence for XAI comparison
         "gold_label": sample["gold_label"],
+        "gold_label_norm": gold_label_norm,
         "model_verdict": model_verdict,
+        "model_verdict_norm": model_verdict_norm,
         "final_verdict": final_verdict,
+        "final_verdict_norm": final_verdict_norm,
         "model_correct": model_correct,
         "final_correct": final_correct,
         "debate_info": debate_info,
@@ -564,8 +812,9 @@ def save_results(
     if has_debate:
         logger.info(f"\n📊 Generating Debate Metrics & Visualizations...")
         
-        debate_dir = split_dir / "debate_analysis"
-        debate_dir.mkdir(parents=True, exist_ok=True)
+        # Save metrics to metrics/ folder (Dec 24, 2025 cleanup)
+        metrics_dir = split_dir / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
         
         # Create metrics tracker
         tracker = DebateMetricsTracker()
@@ -573,6 +822,9 @@ def save_results(
         for r in data["results"]:
             if r.get("final_verdict") == "ERROR":
                 continue
+            
+            # Extract gold label for accuracy computation
+            gold_label = r.get("gold_label", "")
             
             # Extract debate metrics
             debate_metrics = r.get("debate_result", {}).get("metrics", {}) if r.get("debate_result") else {}
@@ -606,6 +858,19 @@ def save_results(
                     agreement_ratio = max(verdict_counts.values()) / len(verdicts) if verdicts else 0.0
                     verdict_changed = (prev_majority is not None and majority_verdict != prev_majority)
                     
+                    # Compute if majority verdict is correct
+                    majority_correct = False
+                    if majority_verdict and gold_label:
+                        # Normalize verdicts for comparison
+                        m_norm = majority_verdict.upper()
+                        if m_norm in ['SUPPORTED', 'SUPPORT']:
+                            m_norm = 'Support'
+                        elif m_norm in ['REFUTED', 'REFUTE']:
+                            m_norm = 'Refute'
+                        else:
+                            m_norm = 'NOT_ENOUGH_INFO'
+                        majority_correct = (m_norm == gold_label)
+                    
                     round_metrics_list.append(RoundMetrics(
                         round_num=round_num,
                         verdicts=verdicts,
@@ -615,6 +880,7 @@ def save_results(
                         agreement_ratio=agreement_ratio,
                         majority_verdict=majority_verdict,
                         verdict_changed_from_prev=verdict_changed,
+                        correct=majority_correct,
                         # XAI fields
                         agree_with=agree_with,
                         agree_reasons=agree_reasons,
@@ -638,6 +904,19 @@ def save_results(
                     majority_verdict = verdict_counts.most_common(1)[0][0] if verdict_counts else "NEI"
                     agreement_ratio = max(verdict_counts.values()) / len(verdicts) if verdicts else 0.0
                     
+                    # Compute if majority verdict is correct
+                    majority_correct = False
+                    if majority_verdict and gold_label:
+                        # Normalize verdicts for comparison
+                        m_norm = majority_verdict.upper()
+                        if m_norm in ['SUPPORTED', 'SUPPORT']:
+                            m_norm = 'Support'
+                        elif m_norm in ['REFUTED', 'REFUTE']:
+                            m_norm = 'Refute'
+                        else:
+                            m_norm = 'NOT_ENOUGH_INFO'
+                        majority_correct = (m_norm == gold_label)
+                    
                     round_metrics_list.append(RoundMetrics(
                         round_num=1,
                         verdicts=verdicts,
@@ -646,7 +925,8 @@ def save_results(
                         roles=roles,
                         agreement_ratio=agreement_ratio,
                         majority_verdict=majority_verdict,
-                        verdict_changed_from_prev=False
+                        verdict_changed_from_prev=False,
+                        correct=majority_correct
                     ))
             
             sample = DebateSampleMetrics(
@@ -666,117 +946,10 @@ def save_results(
             tracker.add_sample(sample)
         
         # Save metrics JSON
-        metrics_file = debate_dir / f"debate_metrics_{split}.json"
+        metrics_file = metrics_dir / f"debate_metrics_{split}.json"
         tracker.save_metrics(str(metrics_file))
         saved_files["debate_metrics"] = metrics_file
         
-        # Generate plots
-        try:
-            # Round distribution
-            fig1 = tracker.plot_round_distribution(str(debate_dir / "round_distribution.png"))
-            plt.close(fig1)
-            
-            # Accuracy by round
-            fig2 = tracker.plot_accuracy_by_round(str(debate_dir / "accuracy_by_round.png"))
-            plt.close(fig2)
-            
-            # Debate impact
-            fig3 = tracker.plot_debate_impact(str(debate_dir / "debate_impact.png"))
-            plt.close(fig3)
-            
-            # Accuracy progression across rounds
-            fig4 = tracker.plot_accuracy_progression(str(debate_dir / "accuracy_progression.png"))
-            plt.close(fig4)
-            
-            # Consensus heatmap (inter-agent agreement matrix)
-            fig5 = tracker.plot_consensus_heatmap(str(debate_dir / "consensus_heatmap.png"))
-            if fig5:
-                plt.close(fig5)
-            
-            # Confidence calibration
-            fig6 = tracker.plot_confidence_calibration(str(debate_dir / "confidence_calibration.png"))
-            if fig6:
-                plt.close(fig6)
-            
-            # Verdict flow across stages
-            fig7 = tracker.plot_verdict_flow(str(debate_dir / "verdict_flow.png"))
-            if fig7:
-                plt.close(fig7)
-            
-            # Agent performance comparison
-            fig8 = tracker.plot_agent_performance(str(debate_dir / "agent_performance.png"))
-            if fig8:
-                plt.close(fig8)
-            
-            # Error analysis
-            fig9 = tracker.plot_error_analysis(str(debate_dir / "error_analysis.png"))
-            if fig9:
-                plt.close(fig9)
-            
-            logger.info(f"📈 Debate plots saved to: {debate_dir}/")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not generate debate plots: {e}")
-        
-        # Generate case study report
-        try:
-            report_file = debate_dir / f"case_study_report_{split}.txt"
-            tracker.generate_case_study_report(str(report_file))
-            saved_files["case_study_report"] = report_file
-        except Exception as e:
-            logger.warning(f"⚠️ Could not generate case study report: {e}")
-        
-        # =====================================================================
-        # XAI METRICS (Quantitative Explainability)
-        # =====================================================================
-        logger.info(f"\n📊 Generating XAI Metrics...")
-        
-        try:
-            xai_samples = []
-            for r in data["results"]:
-                if r.get("final_verdict") == "ERROR":
-                    continue
-                
-                sample_id = str(r.get("id", ""))
-                
-                # Debate metrics only (Gold Evidence mode - no Hunter)
-                round_1_verdicts = r.get("debate_result", {}).get("round_1_verdicts", {}) if r.get("debate_result") else {}
-                final_verdict = r.get("final_verdict", "NEI")
-                final_reasoning = r.get("debate_result", {}).get("reasoning", "") if r.get("debate_result") else ""
-                rounds_used = r.get("debate_result", {}).get("metrics", {}).get("rounds_used", 1) if r.get("debate_result") else 1
-                
-                debate_metrics = calculate_debate_metrics(
-                    round_1_verdicts=round_1_verdicts,
-                    final_verdict=final_verdict,
-                    final_reasoning=final_reasoning,
-                    rounds_used=rounds_used
-                )
-                
-                xai_samples.append(XAISampleMetrics(
-                    sample_id=sample_id,
-                    debate_metrics=debate_metrics
-                ))
-            
-            # Generate XAI report with charts
-            xai_dir = debate_dir / "xai_analysis"
-            xai_report = generate_xai_report(xai_samples, str(xai_dir))
-            saved_files["xai_metrics"] = xai_report.get("metrics_file")
-            saved_files["xai_charts"] = xai_report.get("charts", {})
-            
-            # Print XAI summary (Debate metrics only - Gold Evidence mode)
-            agg = xai_report.get("aggregate", {})
-            debate_agg = agg.get("debate", {})
-
-            logger.info(f"\n⚖️ DEBATE QUALITY EVALUATION ({split.upper()}):")
-            logger.info(f"  • Consensus Level:    {debate_agg.get('avg_round_1_agreement', 0):.2%} (Round 1 Agreement)")
-            logger.info(f"  • Reasoning Match:    {debate_agg.get('avg_verdict_match', 0):.2%} (Verdict-Reason Consistency)")
-            logger.info(f"  • 'Drama' Index:      {debate_agg.get('flip_rate', 0):.2%} (Flip Rate - Agents changing minds)")
-            
-            logger.info(f"\n📈 XAI charts saved to: {xai_dir}/")
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Could not generate XAI metrics: {e}")
-            import traceback
-            traceback.print_exc()
         
         # Print debate summary
         debate_summary = tracker.get_summary()
@@ -832,6 +1005,29 @@ def main():
         "--hybrid-debate",
         action="store_true",
         help="Run debate ONLY when model confidence < threshold (DOWN Framework)"
+    )
+    
+    # Consensus-Based Debate Config (Dec 2025)
+    parser.add_argument(
+        "--max-rounds",
+        nargs="+",
+        default=None,
+        help="Max rounds configs to test (e.g., --max-rounds 3 5 7). If not set, uses config file value."
+    )
+    parser.add_argument(
+        "--run-all-configs",
+        action="store_true",
+        help="Run all max_rounds configs (3, 5, 7) and generate comparison report"
+    )
+    parser.add_argument(
+        "--run-both-modes",
+        action="store_true",
+        help="Run BOTH early-stop and fixed modes for the selected max_rounds configs (scope: 3, 5, 7)"
+    )
+    parser.add_argument(
+        "--fixed",
+        action="store_true",
+        help="Fixed rounds mode: run exactly K rounds without early stopping (default: early stop enabled)"
     )
     
     # Checkpoint/Resume
@@ -940,6 +1136,17 @@ def main():
     
     config.use_async_debate = args.async_debate
     
+    # Determine max_rounds configs to run
+    if args.run_all_configs or args.run_both_modes:
+        # Scope-aligned (Dec 2025): Only 3-5-7
+        max_rounds_configs = ["3", "5", "7"]
+    elif args.max_rounds:
+        max_rounds_configs = args.max_rounds
+    else:
+        max_rounds_configs = [None]  # Use config file value (single run)
+    
+    debate_mode_folder = "hybrid_debate" if args.hybrid_subdir else "full_debate"
+    
     logger.info("\n" + "="*80)
     logger.info("VIFACTCHECK FULL EVALUATION".center(80))
     logger.info("="*80)
@@ -948,6 +1155,8 @@ def main():
     logger.info(f"⚡ Async: {'✓' if args.async_debate else '✗'}")
     if config.use_debate:
         logger.info(f"🎯 Debate Mode: {debate_mode_str}")
+        if args.run_all_configs or args.max_rounds:
+            logger.info(f"🔄 Max Rounds Configs: {max_rounds_configs}")
         if args.hybrid_subdir:
             logger.info(f"📁 Output Mode: HYBRID → {{split}}/hybrid_debate/")
         else:
@@ -963,156 +1172,193 @@ def main():
         logger.info(f"🔇 Quiet Mode: ✓ (pipeline logs suppressed)")
     logger.info(f"📊 Base Output: {args.output_dir}")
     logger.info("="*80)
+
+    # Store results for all configs (for comparison report)
+    all_experiment_results = {}
     
-    # Process each split
-    all_results = {}
-    
-    for split in args.splits:
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Processing {split.upper()} split".center(80))
-        logger.info(f"{'='*80}\n")
-        
-        # Determine output directory for this split
-        if args.hybrid_subdir:
-            # Hybrid mode: results/vifactcheck/{split}/hybrid_debate/
-            split_output_dir = args.output_dir / split / "hybrid_debate"
-        else:
-            # Full debate: results/vifactcheck/{split}/full_debate/
-            split_output_dir = args.output_dir / split / "full_debate"
-        
-        # Run pipeline
-        split_results = run_pipeline_on_split(
-            split=split,
-            config=config,
-            checkpoint_every=args.checkpoint_every,
-            resume=args.resume,
-            output_dir=split_output_dir,
-            max_samples=args.max_samples,
-            batch_size=args.batch_size,
-            quiet=args.quiet
-        )
-        
-        # Save results (skip_split_subdir=True because split_output_dir already includes full path)
-        saved_files = save_results(split_results, split, split_output_dir, skip_split_subdir=True)
-        all_results[split] = {
-            "data": split_results,
-            "files": saved_files
-        }
-        
-        # Run evaluation & plots (default: True, skip if --no-report)
-        if args.full_report and not args.no_report:
-            logger.info(f"\n📊 Generating metrics & plots for {split}...")
-            try:
-                # Step 1: Call evaluate_results.py to compute metrics
-                import subprocess
-                eval_script = Path(__file__).parent / "evaluate_results.py"
-                result_file = saved_files["full_results"]
+    # Adaptive strategy: Start with round 3, progressively increase if hit_cap_rate >= threshold
+    adaptive_threshold = 0.06  # 6% threshold
+    configs_to_run = []
+
+    # If running both modes in one command, do NOT use adaptive scheduling.
+    # We want full coverage: (earlystop + fixed) x (3,5,7)
+    if args.run_both_modes:
+        configs_to_run = max_rounds_configs
+    elif args.run_all_configs:
+        # Adaptive mode: Start with 3, add more configs based on hit_cap_rate
+        configs_to_run = ["3"]  # Always start with 3
+        logger.info(f"\n🎯 ADAPTIVE STRATEGY: Starting with max_rounds=3")
+        logger.info(f"   Will continue to higher rounds if hit_cap_rate >= {adaptive_threshold:.0%}")
+    else:
+        configs_to_run = max_rounds_configs
+
+    # Determine which debate execution modes to run
+    modes_to_run = [args.fixed]
+    if args.run_both_modes:
+        modes_to_run = [False, True]  # earlystop then fixed
+
+    # Loop through modes x max_rounds configs
+    for fixed_mode in modes_to_run:
+        # Loop through max_rounds configs
+        for idx, max_rounds_str in enumerate(configs_to_run):
+            if max_rounds_str is not None:
+                max_rounds = parse_max_rounds_arg(max_rounds_str)
+                update_debate_config(max_rounds, fixed_mode=fixed_mode)
+                config_name = max_rounds_str
+            else:
+                config_name = "default"
+            
+            # Determine mode prefix for folder naming (Dec 24, 2025 - align with scope)
+            if fixed_mode:
+                mode_prefix = "fixed"
+                mode_display = f"FIXED K={config_name}"
+            else:
+                mode_prefix = "earlystop"
+                mode_display = f"EARLYSTOP max={config_name}"
+            
+            logger.info(f"\n{'#'*80}")
+            logger.info(f"CONFIG: {mode_display}".center(80))
+            logger.info(f"{'#'*80}")
+            
+            # Unique key so comparison report can include both modes
+            config_key = f"{mode_prefix}_{config_name}"
+            all_experiment_results[config_key] = {}
+
+            # Process each split for this config
+            for split in args.splits:
+                logger.info(f"\n{'='*80}")
+                logger.info(f"Processing {split.upper()} split ({mode_display})".center(80))
+                logger.info(f"{'='*80}\n")
                 
-                # Create metrics directory and set proper metrics file path
-                # split_output_dir already includes full path (full_debate or hybrid_debate)
-                metrics_dir = split_output_dir / "metrics"
-                metrics_dir.mkdir(parents=True, exist_ok=True)
-                metrics_file = metrics_dir / f"metrics_{split}.json"
+                # Determine output directory for this split + config
+                # Structure: results/vifactcheck/{split}/{debate_mode}/{mode_prefix}_k{rounds}/
+                # Dec 24, 2025: folder naming aligned with scope (fixed_k3, earlystop_k7, etc.)
+                if config_name in ['none', 'inf', 'default']:
+                    config_folder = f"{mode_prefix}_k7"  # Safety default
+                else:
+                    config_folder = f"{mode_prefix}_k{config_name}"
                 
-                subprocess.run([
-                    sys.executable,
-                    str(eval_script),
-                    str(result_file),
-                    "--save-metrics",
-                    str(metrics_file)
-                ], check=True)
-                
-                logger.info(f"✅ Metrics saved to: {metrics_file}")
-                
-                # Print metrics summary to console
-                logger.info(f"\n📊 ===== METRICS SUMMARY ({split.upper()}) =====")
-                with open(metrics_file, 'r', encoding='utf-8') as f:
-                    metrics = json.load(f)
-                
-                logger.info(f"\n📈 Overall:")
-                logger.info(f"  Model Accuracy:  {metrics['model_accuracy']:.2%}")
-                logger.info(f"  Final Accuracy:  {metrics['final_accuracy']:.2%}")
-                
-                logger.info(f"\n📊 Final Macro-Averaged:")
-                final_macro = metrics["final_macro"]
-                logger.info(f"  Precision: {final_macro['macro_precision']:.4f}")
-                logger.info(f"  Recall:    {final_macro['macro_recall']:.4f}")
-                logger.info(f"  F1:        {final_macro['macro_f1']:.4f}")
-                
-                logger.info(f"\n📋 Per-Class (Final):")
-                logger.info(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
-                logger.info("-" * 70)
-                for label, m in metrics["final_per_class"].items():
-                    logger.info(f"{label:<20} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1']:>10.4f} {m['support']:>10}")
-                
-                if metrics.get("debate_impact"):
-                    debate = metrics["debate_impact"]
-                    logger.info(f"\n💬 Debate Impact:")
-                    logger.info(f"  Fixed:  {debate['fixed']} samples ({debate['fix_rate']:.2f}%)")
-                    logger.info(f"  Broken: {debate['broken']} samples ({debate['break_rate']:.2f}%)")
-                
-                logger.info(f"\n{'='*80}\n")
-                
-                # Step 2: Generate plots using plot_metrics.py
-                logger.info(f"\n📈 Generating plots for {split}...")
-                
-                # Import plot_metrics module
-                import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    "plot_metrics",
-                    Path(__file__).parent / "plot_metrics.py"
-                )
-                plot_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(plot_module)
-                
-                # Load metrics
-                with open(metrics_file, 'r', encoding='utf-8') as f:
-                    metrics = json.load(f)
-                
-                # Generate plots
-                charts_dir = split_output_dir / "charts"
-                plot_module.generate_all_plots(metrics, split_results["results"], split.upper(), charts_dir)
-                
-                logger.info(f"✅ All plots saved to: {charts_dir}/")
-                
-                # Step 3: Generate Hybrid Analysis (for hybrid mode)
                 if args.hybrid_subdir:
-                    logger.info(f"\n📊 Generating Hybrid Analysis for {split}...")
-                    try:
-                        from src.pipeline.run_pineline.hybrid_analysis import HybridAnalyzer
-                        
-                        # Use the results file as input
-                        analyzer = HybridAnalyzer(str(result_file))
-                        hybrid_report = analyzer.generate_full_report(
-                            output_dir=str(split_output_dir),
-                            thresholds=None  # Use default thresholds
-                        )
-                        logger.info(f"✅ Hybrid analysis saved to: {split_output_dir}/")
-                    except Exception as he:
-                        logger.warning(f"⚠️  Could not generate hybrid analysis: {he}")
-                    
-                    # Step 4: Generate Thesis Charts
-                    logger.info(f"\n📊 Generating Thesis Charts for {split}...")
-                    try:
-                        from src.pipeline.run_pineline.generate_thesis_charts import ThesisChartGenerator
-                        
-                        # Find full_debate dir for comparison
-                        full_debate_dir = args.output_dir / split / "full_debate"
-                        if full_debate_dir.exists():
-                            generator = ThesisChartGenerator(str(split_output_dir), str(full_debate_dir))
-                        else:
-                            generator = ThesisChartGenerator(str(split_output_dir))
-                        
-                        generator.generate_all(str(split_output_dir))
-                        logger.info(f"✅ Thesis charts saved to: {split_output_dir}/")
-                    except Exception as te:
-                        logger.warning(f"⚠️  Could not generate thesis charts: {te}")
+                    split_output_dir = args.output_dir / split / "hybrid_debate" / config_folder
+                else:
+                    split_output_dir = args.output_dir / split / "full_debate" / config_folder
                 
-            except Exception as e:
-                logger.warning(f"⚠️  Could not generate metrics/plots: {e}")
-                import traceback
-                traceback.print_exc()
-    
+                # Run pipeline
+                split_results = run_pipeline_on_split(
+                    split=split,
+                    config=config,
+                    checkpoint_every=args.checkpoint_every,
+                    resume=args.resume,
+                    output_dir=split_output_dir,
+                    max_samples=args.max_samples,
+                    batch_size=args.batch_size,
+                    quiet=args.quiet
+                )
+                
+                # Save results
+                saved_files = save_results(split_results, split, split_output_dir, skip_split_subdir=True)
+                
+                # Store for comparison report
+                all_experiment_results[config_key][split] = split_results
+
+                # Run evaluation & plots (default: True, skip if --no-report)
+                if args.full_report and not args.no_report:
+                    logger.info(f"\n📊 Generating metrics & plots for {split}...")
+                    try:
+                        # Step 1: Call evaluate_results.py to compute metrics
+                        import subprocess
+                        eval_script = Path(__file__).parent / "evaluate_results.py"
+                        result_file = saved_files["full_results"]
+                        
+                        # Create metrics directory and set proper metrics file path
+                        metrics_dir = split_output_dir / "metrics"
+                        metrics_dir.mkdir(parents=True, exist_ok=True)
+                        metrics_file = metrics_dir / f"metrics_{split}.json"
+                        
+                        subprocess.run([
+                            sys.executable,
+                            str(eval_script),
+                            str(result_file),
+                            "--save-metrics",
+                            str(metrics_file)
+                        ], check=True)
+                        
+                        logger.info(f"✅ Metrics saved to: {metrics_file}")
+                        
+                        # Print metrics summary to console
+                        logger.info(f"\n📊 ===== METRICS SUMMARY ({split.upper()}) =====")
+                        with open(metrics_file, 'r', encoding='utf-8') as f:
+                            metrics = json.load(f)
+                        
+                        logger.info(f"\n📈 Overall:")
+                        logger.info(f"  Model Accuracy:  {metrics['model_accuracy']:.2%}")
+                        logger.info(f"  Final Accuracy:  {metrics['final_accuracy']:.2%}")
+                        
+                        logger.info(f"\n📊 Final Macro-Averaged:")
+                        final_macro = metrics["final_macro"]
+                        logger.info(f"  Precision: {final_macro['macro_precision']:.4f}")
+                        logger.info(f"  Recall:    {final_macro['macro_recall']:.4f}")
+                        logger.info(f"  F1:        {final_macro['macro_f1']:.4f}")
+                        
+                        logger.info(f"\n📋 Per-Class (Final):")
+                        logger.info(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
+                        logger.info("-" * 70)
+                        for label, m in metrics["final_per_class"].items():
+                            logger.info(f"{label:<20} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1']:>10.4f} {m['support']:>10}")
+                        
+                        if metrics.get("debate_impact"):
+                            debate = metrics["debate_impact"]
+                            logger.info(f"\n💬 Debate Impact:")
+                            logger.info(f"  Fixed:  {debate['fixed']} samples ({debate['fix_rate']:.2f}%)")
+                            logger.info(f"  Broken: {debate['broken']} samples ({debate['break_rate']:.2f}%)")
+                        
+                        logger.info(f"\n{'='*80}\n")
+                        
+                        # Step 2: Generate plots using plot_metrics.py
+                        logger.info(f"\n📈 Generating plots for {split}...")
+                        import importlib.util
+                        spec = importlib.util.spec_from_file_location(
+                            "plot_metrics",
+                            Path(__file__).parent / "plot_metrics.py"
+                        )
+                        plot_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(plot_module)
+                        
+                        with open(metrics_file, 'r', encoding='utf-8') as f:
+                            metrics = json.load(f)
+                        
+                        charts_dir = split_output_dir / "charts"
+                        plot_module.generate_all_plots(metrics, split_results["results"], split.upper(), charts_dir)
+                        logger.info(f"✅ All plots saved to: {charts_dir}/")
+                    except Exception as e:
+                        logger.warning(f"⚠️  Could not generate metrics/plots: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+            # Adaptive strategy: Check if we need to run higher rounds
+            # Only apply to single-mode run-all-configs (not run-both-modes)
+            if (not args.run_both_modes) and args.run_all_configs and idx == len(configs_to_run) - 1:
+                all_splits_results = []
+                for split_name, split_data in all_experiment_results[config_key].items():
+                    if split_data.get("results"):
+                        all_splits_results.extend(split_data["results"])
+                
+                if all_splits_results:
+                    metrics = analyze_debate_metrics(all_splits_results)
+                    hit_cap_rate = metrics.get("hit_cap_rate", 0)
+                    logger.info(f"\n📊 ADAPTIVE DECISION for max_rounds={config_name}:")
+                    logger.info(f"   hit_cap_rate = {hit_cap_rate:.1%}")
+                    if hit_cap_rate >= adaptive_threshold:
+                        next_config_map = {"3": "5", "5": "7"}
+                        next_config = next_config_map.get(config_name)
+                        if next_config:
+                            configs_to_run.append(next_config)
+                            logger.info(f"   ✅ hit_cap_rate >= {adaptive_threshold:.0%} → Adding max_rounds={next_config}")
+                        else:
+                            logger.info(f"   ⏹️  Already at max_rounds=7, no higher config available")
+                    else:
+                        logger.info(f"   ⏹️  hit_cap_rate < {adaptive_threshold:.0%} → Stopping adaptive strategy")
+
     # Calibration workflow
     if args.calibration and "dev" in args.splits and "test" in args.splits:
         logger.info("\n" + "="*80)
@@ -1123,19 +1369,23 @@ def main():
         logger.info("⚠️  TODO: Implement calibration workflow")
         # TODO: Call calibration_3label.py here
     
+    # Generate comparison report if multiple configs
+    if len(max_rounds_configs) > 1:
+        debate_mode = "hybrid_debate" if args.hybrid_subdir else "full_debate"
+        generate_comparison_report(all_experiment_results, args.output_dir, debate_mode)
+    
     # Final summary
     logger.info("\n" + "="*80)
     logger.info("EVALUATION COMPLETE".center(80))
     logger.info("="*80)
     
-    for split in args.splits:
-        data = all_results[split]["data"]
-        logger.info(f"\n📊 {split.upper()} Results:")
-        logger.info(f"  Model Accuracy:  {data['model_accuracy']:.2%}")
-        logger.info(f"  Final Accuracy:  {data['final_accuracy']:.2%}")
-        logger.info(f"  Improvement:     {data['final_accuracy'] - data['model_accuracy']:+.2%}")
-        logger.info(f"  Total Time:      {data['total_seconds']:.2f}s")
-        logger.info(f"  Avg per sample:  {data['avg_per_sample']:.2f}s")
+    for config_name, splits_data in all_experiment_results.items():
+        logger.info(f"\n📊 Config: max_rounds = {config_name}")
+        for split, data in splits_data.items():
+            logger.info(f"  {split.upper()}:")
+            logger.info(f"    Model Accuracy:  {data.get('model_accuracy', 0):.2%}")
+            logger.info(f"    Final Accuracy:  {data.get('final_accuracy', 0):.2%}")
+            logger.info(f"    Improvement:     {data.get('final_accuracy', 0) - data.get('model_accuracy', 0):+.2%}")
     
     logger.info("\n✅ All evaluations completed successfully!")
 

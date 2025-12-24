@@ -98,19 +98,19 @@ def format_single_case(sample: Dict[str, Any], case_num: int) -> str:
     lines.append("")
     
     # Gold label
-    gold_label = sample.get("gold_label", "N/A")
+    gold_label = sample.get("gold_label_norm") or sample.get("gold_label", "N/A")
     lines.append(f"**Nhãn thực tế:** {get_verdict_emoji(gold_label)} {get_verdict_vi(gold_label)}")
     lines.append("")
     
     # Model prediction
-    model_verdict = sample.get("model_verdict", "N/A")
+    model_verdict = sample.get("model_verdict_norm") or sample.get("model_verdict", "N/A")
     model_correct = sample.get("model_correct", False)
     model_icon = "✅" if model_correct else "❌"
     lines.append(f"**PhoBERT dự đoán:** {get_verdict_emoji(model_verdict)} {get_verdict_vi(model_verdict)} {model_icon}")
     lines.append("")
     
     # Final verdict
-    final_verdict = sample.get("final_verdict", "N/A")
+    final_verdict = sample.get("final_verdict_norm") or sample.get("final_verdict", "N/A")
     final_correct = sample.get("final_correct", False)
     final_icon = "✅" if final_correct else "❌"
     lines.append(f"**Kết luận cuối:** {get_verdict_emoji(final_verdict)} **{get_verdict_vi(final_verdict)}** {final_icon}")
@@ -123,38 +123,79 @@ def format_single_case(sample: Dict[str, Any], case_num: int) -> str:
         lines.append("#### 🗣️ Hội đồng tranh luận")
         lines.append("")
         
-        # Round 1
-        r1_verdicts = debate_result.get("round_1_verdicts", {})
-        if r1_verdicts:
-            lines.append("**Vòng 1 - Phân tích độc lập:**")
-            lines.append("")
-            for agent_id, data in r1_verdicts.items():
-                agent_name = AGENT_NAME.get(agent_id, agent_id.split("/")[-1])
-                emoji = AGENT_EMOJI.get(agent_id, "🔹")
-                verdict = data.get("verdict", "N/A")
-                reasoning = data.get("reasoning", "N/A")
-                lines.append(f"> {emoji} **{agent_name}** ({get_verdict_vi(verdict)}): \"{reasoning}\"")
-                lines.append(">")
-            lines.append("")
-        
-        # Round 2
+        # Process all rounds dynamically
         all_rounds = debate_result.get("all_rounds_verdicts", [])
-        if len(all_rounds) >= 2:
-            r2_data = all_rounds[1]  # Round 2 is index 1
-            lines.append("**Vòng 2 - Tranh luận & Chốt kèo:**")
-            lines.append("")
-            for agent_id, data in r2_data.items():
-                agent_name = AGENT_NAME.get(agent_id, agent_id.split("/")[-1])
-                emoji = AGENT_EMOJI.get(agent_id, "🔹")
-                verdict = data.get("verdict", "N/A")
-                reasoning = data.get("reasoning", "N/A")
-                # Check if changed
-                r1_verdict = r1_verdicts.get(agent_id, {}).get("verdict", "")
-                changed = r1_verdict != verdict
-                change_note = " *(đổi ý)*" if changed else ""
-                lines.append(f"> {emoji} **{agent_name}** ({get_verdict_vi(verdict)}{change_note}): \"{reasoning}\"")
-                lines.append(">")
-            lines.append("")
+        if all_rounds:
+            for round_idx, round_data in enumerate(all_rounds):
+                round_num = round_idx + 1
+                
+                if round_num == 1:
+                    lines.append("**Vòng 1 - Phân tích độc lập:**")
+                elif round_num == len(all_rounds):
+                    lines.append(f"**Vòng {round_num} - Chốt kèo cuối cùng:**")
+                else:
+                    lines.append(f"**Vòng {round_num} - Tranh luận:**")
+                
+                lines.append("")
+                for agent_id, data in round_data.items():
+                    agent_name = AGENT_NAME.get(agent_id, agent_id.split("/")[-1])
+                    emoji = AGENT_EMOJI.get(agent_id, "🔹")
+                    verdict = data.get("verdict", "N/A")
+                    reasoning = data.get("reasoning", "N/A")
+                    
+                    # XAI fields (Dec 24, 2025 - show debate interaction)
+                    key_points = data.get("key_points", [])
+                    disagree_with = data.get("disagree_with", [])
+                    disagree_reason = data.get("disagree_reason", "")
+                    changed = data.get("changed", False)
+                    change_reason = data.get("change_reason", "")
+                    change_trigger = data.get("change_trigger", "")
+                    
+                    # Check if changed from round 1
+                    if round_num > 1 and all_rounds:
+                        r1_data = all_rounds[0]
+                        r1_verdict = r1_data.get(agent_id, {}).get("verdict", "")
+                        verdict_changed = r1_verdict != verdict
+                        change_note = " 🔄 **(ĐỔI Ý!)**" if (verdict_changed or changed) else ""
+                    else:
+                        change_note = ""
+                    
+                    # Build agent line with verdict
+                    lines.append(f"> {emoji} **{agent_name}** ({get_verdict_vi(verdict)}{change_note}):")
+                    
+                    # Show key quotes (Up to 2) for ALL rounds to make the debate more vivid
+                    if key_points:
+                        show_quotes = []
+                        for q in key_points[:2]:
+                            if not q:
+                                continue
+                            q_str = str(q)
+                            q_str = q_str[:120] + "..." if len(q_str) > 120 else q_str
+                            show_quotes.append(f"\"{q_str}\"")
+                        if show_quotes:
+                            lines.append(f">   📝 Quote: {' | '.join(show_quotes)}")
+                    
+                    # Show disagreements (Round 2+)
+                    if disagree_with and round_num > 1:
+                        disagree_names = ", ".join([AGENT_NAME.get(d, d.split("/")[-1]) for d in disagree_with])
+                        lines.append(f">   ❌ **Phản đối**: {disagree_names}")
+                        if disagree_reason:
+                            reason_short = disagree_reason[:120] + "..." if len(disagree_reason) > 120 else disagree_reason
+                            lines.append(f">   💬 Lý do: {reason_short}")
+                    
+                    # Show change reason
+                    if change_note and change_reason:
+                        lines.append(f">   🔄 Vì sao đổi: {change_reason}")
+
+                    # Show change trigger (if available)
+                    if change_note and change_trigger:
+                        lines.append(f">   🎯 Trigger: {change_trigger}")
+                    
+                    # Show reasoning
+                    reasoning_short = reasoning[:150] + "..." if len(reasoning) > 150 else reasoning
+                    lines.append(f">   💭 \"{reasoning_short}\"")
+                    lines.append(">")
+                lines.append("")
         
         # Judge conclusion
         judge_reasoning = debate_result.get("reasoning", "")

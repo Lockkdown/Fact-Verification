@@ -130,7 +130,8 @@ class Debator(ABC):
         judge_verdict: str = None,
         judge_confidence: float = None,
         judge_reasoning: str = None,
-        debate_history: Optional[List[List['DebateArgument']]] = None
+        debate_history: Optional[List[List['DebateArgument']]] = None,
+        max_rounds: int = None,
     ) -> str:
         """Build prompt for debator - Clean, evidence-grounded prompts."""
         
@@ -148,130 +149,142 @@ class Debator(ABC):
         else:
             evidence_text = "(No evidence provided)"
             
-        # ===== ROUND 1: INDEPENDENT ANALYSIS =====
+        # ===== ROUND 1: INDEPENDENT ANALYSIS (Parts-based) =====
         if round_num == 1:
-            prompt = f"""You are a FACT-CHECKER. Analyze independently.
+            prompt = f"""You are an EVIDENCE-BASED FACT-CHECKER. Analyze independently. Use ONLY the provided evidence. Do NOT use outside knowledge.
 
 **Claim:** "{claim}"
 **Evidence:** {evidence_text}
 
-**STEP 1: FULL CLAIM CHECK**
-Break the claim into ALL parts. For EACH part, find evidence:
-- Part covered by evidence? → Note the quote
-- Part NOT in evidence? → Mark as "MISSING"
-- Part CONTRADICTED by evidence? → Mark as "CONFLICT"
+**STEP 1: BREAK CLAIM INTO KEY PARTS**
+Identify 2-5 KEY verifiable parts of the claim. 
+(Key parts = core entities, time, location, quantity, or main event described by the claim)
+
+For EACH part:
+- Find a VERBATIM quote from evidence that covers it → status = COVERED
+- If no quote found → status = MISSING, quote = NULL
+- If evidence EXPLICITLY NEGATES the part (opposite value, mutually exclusive) → status = CONFLICT
 
 **STEP 2: DECIDE**
+- ALL key parts COVERED → **SUPPORTED**
+- ANY key part CONFLICT → **REFUTED**
+- Any key part MISSING → **NEI**
 
-| Situation | Verdict |
-|-----------|---------|
-| ALL parts confirmed (paraphrasing OK) | **SUPPORTED** |
-| ANY part CONTRADICTED (opposite fact, wrong description) | **REFUTED** |
-| Key parts MISSING (no info in evidence) | **NEI** |
+**RULES:**
+- Quotes must be VERBATIM substrings copied from Evidence
+- If you cannot find a verbatim quote, set quote = NULL
+- CONFLICT only when evidence explicitly negates (not just missing info)
 
-**CRITICAL RULES:**
-1. **CHECK THE WHOLE CLAIM:** Don't just match what evidence says. Check if claim has EXTRA parts not in evidence.
-   - Claim adds specific details (names, dates, places) not in evidence → **NEI**
-2. **SILENCE ≠ CONTRADICTION:**
-   - Evidence not mentioning X ≠ Evidence saying X is false → **NEI**
-3. **MISREPRESENTATION = CONTRADICTION:**
-   - Claim describes method/event A, evidence describes different method/event B → **REFUTED**
-
-**CHỈ TRẢ VỀ JSON:**
+**Output JSON:**
 {{
-    "key_quote": "Copy EXACT text from evidence",
+    "parts": [
+        {{"part": "key part of claim", "status": "COVERED | MISSING | CONFLICT", "quote": "VERBATIM quote OR NULL"}}
+    ],
     "verdict": "SUPPORTED | REFUTED | NEI",
-    "confidence": 0.0-1.0,
-    "reasoning_vi": "Giải thích ngắn gọn bằng tiếng Việt"
+    "reasoning_vi": "1-2 câu giải thích"
 }}"""
         
-        # ===== ROUND 2: CROSS-EXAMINATION =====
+        
+        # ===== ROUND 2+: DEBATE (Evidence-grounded rebuttals) =====
         else:
-            # Find own R1 verdict and reasoning
-            own_r1_verdict = "N/A"
-            own_r1_conf_str = ""
-            own_r1_reason = ""
+            # Find own previous position (Fix 6: get quotes from parts or key_points)
+            own_prev_verdict = "N/A"
+            own_prev_quotes = []
+            
             if previous_arguments:
                 for arg in previous_arguments:
                     if arg.debator_name == self.name:
-                        own_r1_verdict = arg.verdict
-                        own_r1_conf_str = f" ({arg.confidence:.0%})"
-                        own_r1_reason = arg.reasoning[:150] + "..." if len(arg.reasoning) > 150 else arg.reasoning
+                        own_prev_verdict = arg.verdict
+                        # Get all quotes from key_points (parser already extracts from parts)
+                        if arg.key_points:
+                            own_prev_quotes = [q for q in arg.key_points if q and str(q).upper() != "NULL"]
                         break
             
-            # Build own R1 quote
-            own_r1_quote = ""
-            if previous_arguments:
-                for arg in previous_arguments:
-                    if arg.debator_name == self.name and arg.key_points:
-                        own_r1_quote = arg.key_points[0] if arg.key_points else ""
-                        break
+            # Show up to 2 quotes for better context (Fix R2)
+            own_prev_quote_str = " | ".join(own_prev_quotes[:2]) if own_prev_quotes else "(no quote)"
             
-            # Build colleagues list with their verdicts
-            colleagues_info = []
+            # Build other agents' positions
+            other_agents = []
+            has_disagreement = False
             if previous_arguments:
                 for arg in previous_arguments:
                     if arg.debator_name != self.name:
-                        colleague_name = self.ROLE_NAME_MAP.get(arg.role, arg.debator_name)
-                        colleague_quote = arg.key_points[0] if arg.key_points else "(no quote)"
-                        colleagues_info.append({
-                            "name": colleague_name,
+                        agent_name = self.ROLE_NAME_MAP.get(arg.role, arg.debator_name)
+                        # Get up to 2 non-null quotes (Fix R2)
+                        quotes = [q for q in (arg.key_points or []) if q and str(q).upper() != "NULL"]
+                        quote_str = " | ".join(quotes[:2]) if quotes else "(no quote)"
+                        other_agents.append({
+                            "name": agent_name,
                             "verdict": arg.verdict,
-                            "confidence": arg.confidence,
-                            "quote": colleague_quote,
-                            "reasoning": arg.reasoning[:100] + "..." if len(arg.reasoning) > 100 else arg.reasoning
+                            "quote": quote_str
                         })
+                        if arg.verdict != own_prev_verdict:
+                            has_disagreement = True
             
-            prompt = f"""**ROUND 2: CROSS-EXAMINATION & FINAL VERDICT**
+            # Build prompt - Evidence-grounded debate with rebuttals
+            prompt = f"""**ROUND {round_num}: DEBATE**
 
 **Claim:** "{claim}"
 **Evidence:** {evidence_text}
 
-**YOUR round 1 PREVIOUS ANALYSIS:**
-- Verdict: {own_r1_verdict}{own_r1_conf_str}
-- Your Quote: "{own_r1_quote}"
-"""
-            if own_r1_reason:
-                prompt += f"- Reasoning: {own_r1_reason}\n"
-            
-            # Colleagues' analysis with quotes
-            if colleagues_info:
-                prompt += "\n**COLLEAGUES' round 1 VERDICTS:**\n"
-                for col in colleagues_info:
-                    prompt += f"- **{col['name']}**: {col['verdict']} ({col['confidence']:.0%})\n"
-                    prompt += f"  Quote: \"{col['quote']}\"\n"
-                    prompt += f"  Reasoning: {col['reasoning']}\n"
-            prompt += """
 ---
 
-**YOUR TASK:**
-Write reasoning in Vietnamese (2-3 sentences), naturally mention: Who you agree/disagree with and why
+**Your previous position:** {own_prev_verdict}
+Your quote: "{own_prev_quote_str}"
 
-**CRITICAL: CHALLENGE, DON'T CONFORM!**
+**Other agents' positions:**
+"""
+            for agent in other_agents:
+                prompt += f"- {agent['name']}: {agent['verdict']} — \"{agent['quote']}\"\n"
+            
+            prompt += f"""
+---
 
-**IF YOU ARE IN MINORITY (your verdict ≠ majority):**
-→ You may be RIGHT! Attack the majority's reasoning:
-  - Did they MISREAD the evidence?
-  - Did they confuse SILENCE with CONTRADICTION?
-  - Find the quote that PROVES them wrong!
+**TASK:**
+1. Identify 2-3 key parts of the claim you are debating
+2. For each agent you DISAGREE with, provide a rebuttal explaining the issue
+3. Decide: MAINTAIN your verdict unless there is STRONG counterevidence
 
-**IF YOU ARE IN MAJORITY:**
-→ Play Devil's Advocate! Challenge yourself:
-  - Did the minority find a quote you MISSED?
-  - Are you just agreeing because others agree?
-  - Re-read the evidence with fresh eyes!
+**RULES:**
+- Quotes must be copied VERBATIM from Evidence
+- For SUPPORTED: key_quote must be a verbatim quote that confirms the claim
+- For REFUTED: key_quote must be a verbatim quote that explicitly contradicts the claim
+- If no such quote exists, set verdict to NEI
+- If any agent has a different verdict, you MUST provide at least one rebuttal
+- Prefer debating the same key parts identified in Round 1 unless new key part is discovered
 
-**DECISION RULE:**
-- CHANGE only if: You find a NEW quote, or realize you MISREAD evidence
-- STAY STUBBORN if: You are just outnumbered but your quote is correct
+**STABILITY & EVIDENCE-GATED UPDATE:**
+- Definition: a counter_quote is a VERBATIM quote from Evidence that directly SUPPORTS or directly REFUTES a debated key part of the Claim.
+- You may CHANGE your verdict only if you can cite a counter_quote that:
+  (1) directly targets a specific key part you listed in key_parts_checked, AND
+  (2) directly CONTRADICTS your previous quote/stance on that same key part (or directly CONFIRMS it if you previously had no supporting/contradicting quote), AND
+  (3) makes the previous interpretation untenable (not just "related" or "plausible").
+- If you do NOT introduce any new quote/counter_quote in this round, you must MAINTAIN your verdict.
+- Use a 2-step change process:
+  - CONSIDER_CHANGE: you found potential counterevidence, but you are not fully committed.
+  - CHANGE: only if the counterevidence is strong and you can clearly explain why it overturns your prior stance.
 
-**OUTPUT (JSON):**
-{
+**Output JSON:**
+{{
+    "key_parts_checked": ["key part 1...", "key part 2..."],
+    "has_new_evidence": true,
+    "has_strong_counterevidence": false,
+    "rebuttals": [
+        {{
+            "agent": "Agent name",
+            "their_verdict": "SUPPORTED | REFUTED | NEI",
+            "their_quote": "their quote",
+            "issue": "irrelevant | not_direct | wrong_context | misses_key_part | weak_contradiction | no_supporting_quote",
+            "counter_quote": "VERBATIM quote OR NULL"
+        }}
+    ],
+    "decision_change": "MAINTAIN | CONSIDER_CHANGE | CHANGE",
+    "changed_from": "SUPPORTED | REFUTED | NEI | N/A",
+    "change_trigger": "stronger_quote | missed_part | context_error | no_supporting_quote | N/A",
     "verdict": "SUPPORTED | REFUTED | NEI",
-    "confidence": 0.0-1.0,
-    "key_quote": "Quote from evidence",
-    "reasoning_vi": "Giải thích bằng tiếng Việt, kết thúc bằng: Tôi giữ nguyên/thay đổi quan điểm, tuyên bố này Đúng/Sai/Thiếu thông tin."
-}"""
+    "key_quote": "VERBATIM quote OR NULL",
+    "reasoning_vi": "1-2 câu: giữ/đổi verdict vì parts + quote nào"
+}}"""
         
         return prompt
     
@@ -421,36 +434,104 @@ Write reasoning in Vietnamese (2-3 sentences), naturally mention: Who you agree/
             }
             verdict = verdict_map.get(raw_verdict, "NEI")
             
-            # Extract key_points - unified schema: key_quote
+            # Extract key_points - multiple sources (Dec 24, 2025 v2)
             key_points = data.get("key_points", [])
+            
+            # New R1 format: parts array with quotes
+            if not key_points:
+                parts = data.get("parts", [])
+                if parts and isinstance(parts, list):
+                    for part_data in parts:
+                        if isinstance(part_data, dict):
+                            quote = part_data.get("quote", "")
+                            if quote and str(quote).upper() != "NULL":
+                                key_points.append(str(quote))
+            
+            # R2+ format: single key_quote
             if not key_points:
                 key_quote = data.get("key_quote", "")
-                if key_quote:
+                if key_quote and str(key_quote).upper() != "NULL":
                     key_points = [str(key_quote)]
-                else:
-                    # Fallback to old schema fields
-                    kp = data.get("evidence_quotes") or data.get("claim_components") or data.get("quote_comparison")
-                    if kp and isinstance(kp, list):
-                        key_points = kp[:3]
-                    elif kp:
-                        key_points = [str(kp)]
+            
+            # Fallback to old schema fields
+            if not key_points:
+                kp = data.get("evidence_quotes") or data.get("claim_components") or data.get("quote_comparison")
+                if kp and isinstance(kp, list):
+                    key_points = kp[:3]
+                elif kp:
+                    key_points = [str(kp)]
             
             # Extract reasoning - unified field: reasoning_vi
             reasoning = data.get("reasoning_vi") or data.get("reasoning") or data.get("final_reasoning_vi", "")
             
-            # Extract Round 2 interaction fields (XAI)
-            agree_with = data.get("agree_with", [])
-            if isinstance(agree_with, str):
-                agree_with = [agree_with] if agree_with else []
-            agree_reason = data.get("agree_reason", "")
+            # Extract Round 2+ interaction fields (Dec 24, 2025 v2 - rebuttals format)
+            agree_with = []
+            disagree_with = []
+            agree_reason = ""
+            disagree_reason = ""
             
-            disagree_with = data.get("disagree_with", [])
-            if isinstance(disagree_with, str):
-                disagree_with = [disagree_with] if disagree_with else []
-            disagree_reason = data.get("disagree_reason", "")
+            # New format: rebuttals array (Dec 24, 2025 v2)
+            rebuttals = data.get("rebuttals", [])
+            if rebuttals and isinstance(rebuttals, list):
+                for rebuttal in rebuttals:
+                    if isinstance(rebuttal, dict):
+                        agent_name = rebuttal.get("agent", "")
+                        issue = rebuttal.get("issue", "")
+                        counter_quote = rebuttal.get("counter_quote", "")
+                        # All rebuttals are disagreements
+                        if agent_name:
+                            disagree_with.append(agent_name)
+                            reason = f"Issue: {issue}"
+                            if counter_quote and counter_quote.upper() != "NULL":
+                                reason += f" | Counter: {counter_quote[:50]}..."
+                            disagree_reason += f"{agent_name}: {reason}; "
             
-            changed = data.get("changed", False)
-            change_reason = data.get("change_reason", "")
+            # Fallback: old other_agents format
+            if not disagree_with:
+                other_agents = data.get("other_agents", [])
+                if other_agents and isinstance(other_agents, list):
+                    for agent_data in other_agents:
+                        if isinstance(agent_data, dict):
+                            agent_name = agent_data.get("agent", "")
+                            stance = agent_data.get("stance", "").upper()
+                            reason = agent_data.get("reason", "")
+                            if stance == "AGREE":
+                                agree_with.append(agent_name)
+                                if reason:
+                                    agree_reason += f"{agent_name}: {reason}; "
+                            elif stance == "DISAGREE":
+                                disagree_with.append(agent_name)
+                                if reason:
+                                    disagree_reason += f"{agent_name}: {reason}; "
+            
+            # Fallback: legacy format
+            if not agree_with and not disagree_with:
+                old_agree = data.get("agree_with", [])
+                if isinstance(old_agree, str):
+                    agree_with = [old_agree] if old_agree else []
+                elif isinstance(old_agree, list):
+                    agree_with = old_agree
+                agree_reason = data.get("agree_reason", "")
+                
+                old_disagree = data.get("disagree_with", [])
+                if isinstance(old_disagree, str):
+                    disagree_with = [old_disagree] if old_disagree else []
+                elif isinstance(old_disagree, list):
+                    disagree_with = old_disagree
+                disagree_reason = data.get("disagree_reason", "")
+            
+            # Decision change tracking (Dec 24, 2025 v2)
+            decision_change = data.get("decision_change", "").upper()
+            # Backward-compatible:
+            # - Old prompt: KEPT | CHANGED
+            # - New prompt (stability): MAINTAIN | CONSIDER_CHANGE | CHANGE
+            # - Legacy boolean: changed
+            changed = decision_change in ["CHANGED", "CHANGE"] or data.get("changed", False)
+            changed_from = data.get("changed_from", "")
+            change_reason = f"Changed from {changed_from}" if changed and changed_from else ""
+            
+            # Key parts checked (for metrics/debugging)
+            key_parts_checked = data.get("key_parts_checked", [])
             
             return DebateArgument(
                 debator_name=self.name,
@@ -513,7 +594,8 @@ class GenericDebator(Debator):
         model_confidence: float = None,
         judge_verdict: str = None,
         judge_confidence: float = None,
-        judge_reasoning: str = None
+        judge_reasoning: str = None,
+        max_rounds: int = None,
     ) -> DebateArgument:
         """
         Generate an argument based on role, claim, gold evidence, and round history.
@@ -528,7 +610,8 @@ class GenericDebator(Debator):
             model_confidence,
             judge_verdict,
             judge_confidence,
-            judge_reasoning
+            judge_reasoning,
+            max_rounds=max_rounds,
         )
         
         # Call LLM
@@ -574,7 +657,8 @@ class GenericDebator(Debator):
         judge_verdict: str = None,
         judge_confidence: float = None,
         judge_reasoning: str = None,
-        debate_history: Optional[List[List[DebateArgument]]] = None
+        debate_history: Optional[List[List[DebateArgument]]] = None,
+        max_rounds: int = None,
     ) -> DebateArgument:
         """Async version of argue method with Gold Evidence."""
         
@@ -589,7 +673,8 @@ class GenericDebator(Debator):
             judge_verdict=judge_verdict,
             judge_confidence=judge_confidence,
             judge_reasoning=judge_reasoning,
-            debate_history=debate_history
+            debate_history=debate_history,
+            max_rounds=max_rounds,
         )
         
         # Call LLM asynchronously with retry logic

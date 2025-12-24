@@ -35,6 +35,7 @@ class RoundMetrics:
     agreement_ratio: float = 0.0  # Tỷ lệ đồng thuận (0-1)
     majority_verdict: str = ""
     verdict_changed_from_prev: bool = False
+    correct: bool = False  # Whether majority_verdict matches gold_label
     # XAI Interaction fields (Round 2+)
     agree_with: Dict[str, List[str]] = field(default_factory=dict)  # {debator: [agents agreed with]}
     agree_reasons: Dict[str, str] = field(default_factory=dict)
@@ -320,13 +321,17 @@ class DebateMetricsTracker:
         
         return fig
     
-    def plot_accuracy_by_round(self, save_path: Optional[str] = None, max_rounds: int = 2) -> plt.Figure:
+    def plot_accuracy_by_round(self, save_path: Optional[str] = None, max_rounds: Optional[int] = None) -> plt.Figure:
         """
         Vẽ biểu đồ accuracy của Majority Vote tại mỗi round.
         
         Args:
             max_rounds: Maximum number of rounds (default 2 for simplified system)
         """
+        # Determine max rounds from actual data if not specified
+        if max_rounds is None:
+            max_rounds = max((rm.round_num for s in self.samples for rm in s.round_metrics), default=2)
+        
         # Calculate majority vote accuracy at each round (dynamic)
         round_stats = {r: {'correct': 0, 'total': 0} for r in range(1, max_rounds + 1)}
         
@@ -392,13 +397,17 @@ class DebateMetricsTracker:
         
         return fig
     
-    def plot_accuracy_progression(self, save_path: Optional[str] = None, max_rounds: int = 2) -> plt.Figure:
+    def plot_accuracy_progression(self, save_path: Optional[str] = None, max_rounds: Optional[int] = None) -> plt.Figure:
         """
         Vẽ biểu đồ tiến triển accuracy qua từng round.
         
         Args:
             max_rounds: Maximum number of rounds (default 2 for simplified system)
         """
+        # Determine max rounds from actual data if not specified
+        if max_rounds is None:
+            max_rounds = max((rm.round_num for s in self.samples for rm in s.round_metrics), default=2)
+        
         # Calculate accuracy at each round (dynamic)
         round_accuracies = {r: {'correct': 0, 'total': 0} for r in range(1, max_rounds + 1)}
         model_correct_count = 0
