@@ -1,27 +1,27 @@
 """
-Gradio Demo UI for Vietnamese Fact Checking with XAI (v2)
+Gradio Demo UI for Vietnamese Fact Checking (v2)
 
 Features:
 - Clean UI: Dark gray theme, white text, no purple
 - Pre-loaded pipeline at startup (no lazy loading)
-- XAI for both Fast Path (PhoBERT) and Slow Path (Judge LLM)
+- Shows Fast Path (PhoBERT) vs Slow Path (Debate) results
+- Displays round-by-round debate process
 
 Author: Lockdown
-Date: Dec 11, 2025
+Date: Dec 25, 2025
 """
 
 import gradio as gr
 import asyncio
 import logging
-import warnings
 import os
+import socket
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
 # Suppress ALL verbose warnings and logs BEFORE imports
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-warnings.filterwarnings("ignore")
 
 # Setup minimal logging
 logging.basicConfig(level=logging.ERROR, format='%(message)s')
@@ -30,6 +30,17 @@ for logger_name in ["transformers", "torch", "httpx", "asyncio", "aiohttp"]:
 
 logger = logging.getLogger(__name__)
 
+def _pick_free_port(preferred: int = 7860) -> int:
+    """Pick a free TCP port. Try preferred first, otherwise let OS pick."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
 # Add project root to path
 import sys
 project_root = Path(__file__).parent.parent.parent
@@ -37,13 +48,12 @@ sys.path.insert(0, str(project_root))
 
 # Global pipeline instance
 PIPELINE = None
-LIME_XAI = None  # LIME XAI for Fast Path explanations
 INIT_STATUS = "Not initialized"
 
 
 def init_pipeline():
     """Initialize pipeline at startup."""
-    global PIPELINE, LIME_XAI, INIT_STATUS
+    global PIPELINE, INIT_STATUS
     
     print("=" * 50)
     print("🔄 Initializing ViFactCheck Pipeline...")
@@ -52,7 +62,6 @@ def init_pipeline():
     
     try:
         from src.pipeline.run_pineline.article_pipeline import ViFactCheckPipeline, PipelineConfig
-        from src.pipeline.fact_checking.xai_lime import load_lime_xai_model
         
         config = PipelineConfig(
             use_debate=True,
@@ -60,12 +69,6 @@ def init_pipeline():
             hybrid_enabled=True
         )
         PIPELINE = ViFactCheckPipeline(config)
-        
-        # Load LIME XAI for Fast Path explanations
-        print("🧠 Loading LIME XAI...")
-        model_path = project_root / "results/fact_checking/pyvi/checkpoints/best_model_pyvi.pt"
-        LIME_XAI = load_lime_xai_model(str(model_path), num_samples=50, device="cpu")
-        print("✅ LIME XAI ready!")
         
         INIT_STATUS = "✅ Ready"
         print("=" * 50)
@@ -106,47 +109,6 @@ def load_sample(idx: int) -> Tuple[str, str, str]:
     return "", "", ""
 
 
-def format_xai_html(xai_dict: Dict[str, Any]) -> str:
-    """Format XAI as clean, simple HTML for end users."""
-    if not xai_dict:
-        return "<p style='color: #888; font-style: italic;'>Không có giải thích chi tiết (Fast Path)</p>"
-    
-    source = xai_dict.get("source", "UNKNOWN")
-    source_text = "PhoBERT" if source == "FAST_PATH" else "Judge AI"
-    
-    explanation = xai_dict.get("natural_explanation", "")
-    conflict_claim = xai_dict.get("conflict_claim") or xai_dict.get("claim_conflict_word") or ""
-    conflict_evidence = xai_dict.get("conflict_evidence") or xai_dict.get("evidence_conflict_word") or ""
-    
-    # Simple card style
-    html = f"""
-    <div style="background: #2a2a2a; padding: 15px; border-radius: 8px; border-left: 4px solid #4a6fa5;">
-        <div style="margin-bottom: 10px; font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px;">
-            Nguồn: {source_text}
-        </div>
-        
-        <div style="font-size: 15px; line-height: 1.6; color: #eee; margin-bottom: 15px;">
-            {explanation}
-        </div>
-    """
-    
-    # Show conflict words (REFUTES) if available
-    if conflict_claim and conflict_evidence:
-        html += f"""
-        <div style="background: #333; padding: 10px; border-radius: 4px; font-size: 13px; margin-top: 10px;">
-            <div style="margin-bottom: 5px;">
-                <strong style="color: #ffb74d;">Mâu thuẫn (Claim):</strong> {conflict_claim}
-            </div>
-            <div>
-                <strong style="color: #4db6ac;">Mâu thuẫn (Evidence):</strong> {conflict_evidence}
-            </div>
-        </div>
-        """
-        
-    html += "</div>"
-    return html
-
-
 def format_debate_html(result: Dict[str, Any]) -> str:
     """Format debate transcript as clean HTML (No MVP)."""
     all_rounds = result.get("debate_all_rounds_verdicts", [])
@@ -184,7 +146,7 @@ def format_debate_html(result: Dict[str, Any]) -> str:
     if metrics:
         html += f"""
         <div style="margin-top: 10px; padding: 8px; background: #2a3a4a; border-radius: 4px; font-size: 12px; color: #bcd;">
-            ⚖️ <strong>Judge Decision</strong> (Sau {metrics.get('rounds_used', '?')} rounds)
+            ⚖️ <strong>Majority Vote</strong> (Sau {metrics.get('rounds_used', '?')} rounds)
         </div>
         """
     
@@ -192,18 +154,18 @@ def format_debate_html(result: Dict[str, Any]) -> str:
     return html
 
 
-async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tuple[str, str, str, str, str, str]:
+async def verify_claim(claim: str, evidence: str):
     """
     Main verification function (no progress bar to avoid UI clutter).
     
-    Returns: verdict_html, path_html, xai_html, debate_html, status
+    Returns: verdict_html, path_html, debate_html, status, dev_trace_html
     """
     if not claim.strip() or not evidence.strip():
-        yield "⚠️ Nhập claim và evidence", "", "", "", "<div style='color:#ffb74d;'>Thiếu input</div>", ""
+        yield "⚠️ Nhập claim và evidence", "", "", "<div style='color:#ffb74d;'>Thiếu input</div>", ""
         return
 
     if PIPELINE is None:
-        yield f"❌ Pipeline chưa sẵn sàng: {INIT_STATUS}", "", "", "", "<div style='color:#ef5350;'>Lỗi</div>", ""
+        yield f"❌ Pipeline chưa sẵn sàng: {INIT_STATUS}", "", "", "<div style='color:#ef5350;'>Lỗi</div>", ""
         return
 
     try:
@@ -219,10 +181,10 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
             return _status("Đang phân tích...")
 
         # Step 0: preparing
-        yield "", "", "", "", (_status("Đang chuẩn bị dữ liệu...") if dev_mode else _status_simple()), ""
+        yield "", "", "", _status("Đang chuẩn bị dữ liệu..."), ""
 
         # Step 1: PhoBERT prediction (sync)
-        yield "", "", "", "", (_status("Đang chạy PhoBERT...") if dev_mode else _status_simple()), ""
+        yield "", "", "", _status("Đang chạy PhoBERT..."), ""
         model_verdict, confidence, probs = PIPELINE._predict_verdict(claim, evidence)
 
         # Step 2: routing decision
@@ -253,12 +215,9 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
             skipped = True
             hybrid_info = {"source": "MODEL_ONLY", "skipped": True}
 
-        if dev_mode:
-            yield "", "", "", "", _status(
-                f"Routing: {'Fast Path (bỏ qua debate)' if skipped else 'Slow Path (tranh luận)'}..."
-            ), ""
-        else:
-            yield "", "", "", "", _status_simple(), ""
+        yield "", "", "", _status(
+            f"Routing: {'Fast Path (bỏ qua debate)' if skipped else 'Slow Path (tranh luận)'}..."
+        ), ""
 
         result: Dict[str, Any] = {
             "statement": claim,
@@ -271,31 +230,13 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
 
         # Step 3: Fast vs Slow execution
         if skipped:
-            # Fast Path XAI
-            if dev_mode:
-                yield "", "", "", "", _status("Fast Path: tạo giải thích (XAI)..."), ""
-            else:
-                yield "", "", "", "", _status_simple(), ""
-
-            xai_dict: Dict[str, Any] = {}
-            if LIME_XAI is not None:
-                lime_result = LIME_XAI.generate_xai(claim, evidence)
-                xai_dict = {
-                    "source": "FAST_PATH",
-                    "natural_explanation": lime_result.get("natural_explanation", ""),
-                    "conflict_claim": lime_result.get("claim_conflict_word", ""),
-                    "conflict_evidence": lime_result.get("evidence_conflict_word", ""),
-                }
+            # Fast Path - no debate needed
             result["final_verdict"] = model_verdict
-            result["debate_xai"] = xai_dict
             result["debate_metrics"] = None
             result["debate_all_rounds_verdicts"] = None
         else:
             # Slow Path debate
-            if dev_mode:
-                yield "", "", "", "", _status("Slow Path: đang tranh luận (debate)..."), ""
-            else:
-                yield "", "", "", "", _status_simple(), ""
+            yield "", "", "", _status("Slow Path: đang tranh luận (debate)..."), ""
 
             from src.pipeline.debate.debator import Evidence as DebateEvidence
 
@@ -307,43 +248,43 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
                 relevance_score=1.0,
             )
 
-            if dev_mode:
-                q: asyncio.Queue = asyncio.Queue()
-                last_status_html = _status("Slow Path: đang tranh luận (debate)...")
-                last_event_ts = asyncio.get_event_loop().time()
-                started_ts = last_event_ts
-                current_round: int = 0
-                phase: str = "debate"  # debate | judge
+            # Always show progress
+            q: asyncio.Queue = asyncio.Queue()
+            last_status_html = _status("Đang chuẩn bị dữ liệu...")
+            last_event_ts = asyncio.get_event_loop().time()
+            started_ts = last_event_ts
+            current_round: int = 0
+            phase: str = "debate"  # debate | judge
 
-                def _progress_cb(event: str, payload: Dict[str, Any]):
-                    q.put_nowait({"event": event, "payload": payload})
+            def _progress_cb(event: str, payload: Dict[str, Any]):
+                q.put_nowait({"event": event, "payload": payload})
 
-                debate_task = asyncio.create_task(
-                    PIPELINE.debate_orchestrator.debate_async(
-                        claim=claim,
-                        evidences=[debate_evidence],
-                        model_verdict=model_verdict,
-                        model_confidence=float(confidence),
-                        progress_cb=_progress_cb,
-                    )
+            debate_task = asyncio.create_task(
+                PIPELINE.debate_orchestrator.debate_async(
+                    claim=claim,
+                    evidences=[debate_evidence],
+                    model_verdict=model_verdict,
+                    model_confidence=float(confidence),
+                    progress_cb=_progress_cb,
                 )
+            )
 
-                # Stream progress while debate is running
-                while not debate_task.done():
-                    try:
-                        item = await asyncio.wait_for(q.get(), timeout=0.4)
-                        ev = item.get("event")
-                        pl = item.get("payload") or {}
-                        last_event_ts = asyncio.get_event_loop().time()
-                        if ev == "ROUND_START":
-                            try:
-                                current_round = int(pl.get("round") or 0)
-                            except Exception:
-                                current_round = current_round or 0
-                            phase = "debate"
-                            last_status_html = _status(f"Slow Path: Round {current_round} đang chạy...")
-                            yield "", "", "", "", last_status_html, ""
-                        elif ev == "ROUND_DONE":
+            # Stream progress while debate is running
+            while not debate_task.done():
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=0.4)
+                    ev = item.get("event")
+                    pl = item.get("payload") or {}
+                    last_event_ts = asyncio.get_event_loop().time()
+                    if ev == "ROUND_START":
+                        try:
+                            current_round = int(pl.get("round") or 0)
+                        except Exception:
+                            current_round = current_round or 0
+                        phase = "debate"
+                        last_status_html = _status(f"Slow Path: Round {current_round} đang chạy...")
+                        yield "", "", "", last_status_html, ""
+                    elif ev == "ROUND_DONE":
                             vc = pl.get("vote_counts") or {}
                             vc_txt = ", ".join([f"{k}:{v}" for k, v in vc.items()])
                             try:
@@ -352,21 +293,21 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
                                 pass
                             phase = "debate"
                             last_status_html = _status(f"Slow Path: Round {current_round} xong ({vc_txt})")
-                            yield "", "", "", "", last_status_html, ""
+                            yield "", "", "", last_status_html, ""
                         elif ev == "JUDGE_START":
-                            last_status_html = _status("Judge: đang tổng hợp kết quả...")
+                            last_status_html = _status("Tổng hợp kết quả debate...")
                             phase = "judge"
-                            yield "", "", "", "", last_status_html, ""
+                            yield "", "", "", last_status_html, ""
                         elif ev == "DEBATE_START":
                             last_status_html = _status("Slow Path: bắt đầu tranh luận...")
                             phase = "debate"
-                            yield "", "", "", "", last_status_html, ""
+                            yield "", "", "", last_status_html, ""
                         elif ev == "JUDGE_DONE":
                             v = pl.get("verdict")
                             c = pl.get("confidence")
-                            last_status_html = _status(f"Judge: đã ra kết luận ({v}, conf={c})")
+                            last_status_html = _status(f"Đã tổng hợp: {v} (conf={c})")
                             phase = "judge"
-                            yield "", "", "", "", last_status_html, ""
+                            yield "", "", "", last_status_html, ""
                         else:
                             # ignore other events
                             pass
@@ -376,20 +317,13 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
                         if (now - last_event_ts) > 2.0 and (now - started_ts) > 2.0:
                             # fallback if events are slow / missing
                             if phase == "judge":
-                                last_status_html = _status("Judge: đang tổng hợp kết quả...")
+                                last_status_html = _status("Đang tổng hợp kết quả...")
                             else:
                                 fallback_round = current_round if current_round > 0 else 1
                                 last_status_html = _status(f"Slow Path: Round {fallback_round} đang chạy...")
-                        yield "", "", "", "", last_status_html, ""
+                        yield "", "", "", last_status_html, ""
 
                 debate_result = await debate_task
-            else:
-                debate_result = await PIPELINE.debate_orchestrator.debate_async(
-                    claim=claim,
-                    evidences=[debate_evidence],
-                    model_verdict=model_verdict,
-                    model_confidence=float(confidence),
-                )
 
             result["debate_verdict"] = debate_result.verdict
             result["debate_confidence"] = round(float(debate_result.confidence), 4)
@@ -406,12 +340,6 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
                 "best_quote_from": getattr(debate_result, "best_quote_from", None),
             }
             result["final_verdict"] = debate_result.verdict
-            result["debate_xai"] = getattr(debate_result, "xai_dict", None)
-
-            if dev_mode:
-                yield "", "", "", "", _status("Judge: tổng hợp & sinh giải thích (XAI)..."), ""
-            else:
-                yield "", "", "", "", _status_simple(), ""
         
         # Extract results
         final_verdict = result.get("final_verdict", "NEI")
@@ -419,7 +347,6 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
         model_conf = result.get("model_confidence", 0.0)
         debate_verdict = result.get("debate_verdict")
         debate_conf = result.get("debate_confidence", 0.0)
-        xai_dict = result.get("debate_xai", {})
 
         # Determine path
         hybrid_info = result.get("hybrid_info", {}) or {}
@@ -469,52 +396,36 @@ async def verify_claim(claim: str, evidence: str, dev_mode: bool = False) -> Tup
         </div>
         """
         
-        # XAI display - use LIME for Fast Path
-        if skipped and LIME_XAI is not None:
-            try:
-                lime_result = LIME_XAI.generate_xai(claim, evidence)
-                xai_dict = {
-                    "source": "FAST_PATH",
-                    "natural_explanation": lime_result.get("natural_explanation", ""),
-                    "conflict_claim": lime_result.get("claim_conflict_word", ""),
-                    "conflict_evidence": lime_result.get("evidence_conflict_word", "")
-                }
-            except Exception as e:
-                xai_dict = {"source": "FAST_PATH", "natural_explanation": f"LIME error: {e}"}
-        
-        xai_html = format_xai_html(xai_dict)
+        # Always show dev trace
+        metrics = result.get("debate_metrics") or {}
+        decision_path = metrics.get("decision_path")
+        best_quote_from = metrics.get("best_quote_from")
+        rounds_used = metrics.get("rounds_used")
+        stop_reason = metrics.get("stop_reason")
+        hybrid_source = hybrid_info.get("source")
+        threshold = hybrid_info.get("threshold")
 
-        dev_trace_html = ""
-        if dev_mode:
-            metrics = result.get("debate_metrics") or {}
-            decision_path = metrics.get("decision_path")
-            best_quote_from = metrics.get("best_quote_from")
-            rounds_used = metrics.get("rounds_used")
-            stop_reason = metrics.get("stop_reason")
-            hybrid_source = hybrid_info.get("source")
-            threshold = hybrid_info.get("threshold")
-
-            dev_trace_html = "<div style='font-size:13px; line-height:1.5; background:#1a1a1a; border:1px solid #333; padding:12px; border-radius:8px;'>"
-            dev_trace_html += "<div style='font-weight:700; margin-bottom:8px;'>Dev Trace</div>"
-            dev_trace_html += f"<div><strong>PhoBERT:</strong> verdict={model_verdict}, conf={model_conf}</div>"
-            dev_trace_html += f"<div><strong>Routing:</strong> {'FAST_PATH' if skipped else 'SLOW_PATH'}</div>"
-            if threshold is not None:
-                dev_trace_html += f"<div><strong>Hybrid:</strong> threshold={threshold}, source={hybrid_source}</div>"
-            else:
-                dev_trace_html += f"<div><strong>Hybrid:</strong> source={hybrid_source}</div>"
-            if not skipped:
-                dev_trace_html += f"<div><strong>Debate:</strong> rounds_used={rounds_used}, stop_reason={stop_reason}</div>"
-                dev_trace_html += f"<div><strong>Judge:</strong> decision_path={decision_path}, best_quote_from={best_quote_from}</div>"
-            dev_trace_html += "</div>"
+        dev_trace_html = "<div style='font-size:13px; line-height:1.5; background:#1a1a1a; border:1px solid #333; padding:12px; border-radius:8px;'>"
+        dev_trace_html += "<div style='font-weight:700; margin-bottom:8px;'>Dev Trace</div>"
+        dev_trace_html += f"<div><strong>PhoBERT:</strong> verdict={model_verdict}, conf={model_conf}</div>"
+        dev_trace_html += f"<div><strong>Routing:</strong> {'FAST_PATH' if skipped else 'SLOW_PATH'}</div>"
+        if threshold is not None:
+            dev_trace_html += f"<div><strong>Hybrid:</strong> threshold={threshold}, source={hybrid_source}</div>"
+        else:
+            dev_trace_html += f"<div><strong>Hybrid:</strong> source={hybrid_source}</div>"
+        if not skipped:
+            dev_trace_html += f"<div><strong>Debate:</strong> rounds_used={rounds_used}, stop_reason={stop_reason}</div>"
+            dev_trace_html += f"<div><strong>Majority Vote:</strong> decision_path={decision_path}, best_quote_from={best_quote_from}</div>"
+        dev_trace_html += "</div>"
         
         # Debate display
         debate_html = format_debate_html(result)
         
-        yield verdict_html, path_html, xai_html, debate_html, "<div style='color:#66bb6a; font-weight:600;'>✅ Hoàn thành</div>", dev_trace_html
+        yield verdict_html, path_html, debate_html, "<div style='color:#66bb6a; font-weight:600;'>✅ Hoàn thành</div>", dev_trace_html
         return
         
     except Exception as e:
-        yield f"❌ Lỗi: {str(e)}", "", "", "", f"<div style='color:#ef5350;'>Lỗi: {str(e)}</div>", ""
+        yield f"❌ Lỗi: {str(e)}", "", "", f"<div style='color:#ef5350;'>Lỗi: {str(e)}</div>", ""
         return
 
 
@@ -629,21 +540,15 @@ def create_demo():
                     verify_btn = gr.Button("🚀 KIỂM TRA", variant="primary", scale=2, size="lg")
 
                 status = gr.HTML(label="Status", value="", visible=True)
-                dev_mode = gr.Checkbox(label="Dev Mode (hiển thị tiến trình chi tiết)", value=False)
         
         gr.HTML("<hr style='border-color: #333; margin: 25px 0;'>")
         
-        # Balanced Results Layout
+        # Results Layout
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column():
                 gr.HTML("<h3 style='color: #fff; text-align: center; font-size: 20px;'>📊 KẾT QUẢ</h3>")
-                # Hide individual progress bars
                 verdict_output = gr.HTML(show_progress="hidden")
                 path_output = gr.HTML(show_progress="hidden")
-            
-            with gr.Column(scale=1):
-                gr.HTML("<h3 style='color: #fff; text-align: center; font-size: 20px;'>🧠 GIẢI THÍCH (XAI)</h3>")
-                xai_output = gr.HTML(show_progress="hidden")
         
         gr.HTML("<hr style='border-color: #333; margin: 25px 0;'>")
         
@@ -660,8 +565,8 @@ def create_demo():
         # Event handlers
         verify_btn.click(
             fn=verify_claim,
-            inputs=[claim_input, evidence_input, dev_mode],
-            outputs=[verdict_output, path_output, xai_output, debate_output, status, dev_trace_output],
+            inputs=[claim_input, evidence_input],
+            outputs=[verdict_output, path_output, debate_output, status, dev_trace_output],
             show_progress="minimal"  # Only show one progress indicator
         )
     
@@ -670,15 +575,26 @@ def create_demo():
 
 if __name__ == "__main__":
     print("🚀 Starting ViFactCheck Demo...")
-    print("📍 URL: http://localhost:7860\n")
+    port = _pick_free_port(7860)
+    print(f"📍 URL: http://localhost:{port}\n")
     
     # Pre-initialize pipeline BEFORE launching UI
     if init_pipeline():
         print("\n🌐 Launching web UI...")
         demo = create_demo()
+
+        # nest_asyncio may monkeypatch asyncio.run() and break uvicorn in threads on Windows.
+        # Restore stdlib implementation to avoid: "There is no current event loop in thread".
+        try:
+            import asyncio.runners as _asyncio_runners
+
+            asyncio.run = _asyncio_runners.run  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         demo.launch(
             server_name="0.0.0.0",
-            server_port=7860,
+            server_port=port,
             share=False,
             show_error=True
         )

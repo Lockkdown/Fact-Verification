@@ -747,7 +747,7 @@ def plot_inter_agent_agreement_matrix(agreement_data: dict, split_name: str, out
     print(f"📊 Saved inter-agent agreement matrix: {output_file}")
 
 
-def plot_round_by_round_accuracy(round_accuracy_data: dict, model_accuracy: float, split_name: str, output_file: str):
+def plot_round_by_round_accuracy(round_accuracy_data: dict, model_accuracy: float, split_name: str, output_file: str, results: List[Dict[str, Any]] = None):
     """
     TIER 1: Plot accuracy improvement across debate rounds.
     
@@ -764,53 +764,129 @@ def plot_round_by_round_accuracy(round_accuracy_data: dict, model_accuracy: floa
         return
     
     # Build data - dynamic multi-round support
-    rounds = ['Model\n(Baseline)']
-    accuracies = [model_accuracy / 100]  # Convert % to decimal
-    
-    # Dynamically add rounds from round_X_accuracy keys - skip null values (Dec 23, 2025)
+    round_nums = []
     round_num = 1
     while f'round_{round_num}_accuracy' in round_accuracy_data:
         acc = round_accuracy_data.get(f'round_{round_num}_accuracy')
         if acc is not None:
-            rounds.append(f'Round {round_num}\n(Majority)')
-            accuracies.append(float(acc))
+            round_nums.append(round_num)
         round_num += 1
-    
-    if 'final_accuracy' in round_accuracy_data:
-        final_acc = round_accuracy_data.get('final_accuracy')
-        if final_acc is not None:
-            rounds.append('Final\n(Judge)')
-            accuracies.append(float(final_acc))
+
+    def _normalize_label(label: str) -> str:
+        if not isinstance(label, str):
+            label = str(label)
+        label = label.upper().strip()
+        if label in ["SUPPORT", "SUPPORTS", "SUPPORTED", "0"]:
+            return "Support"
+        if label in ["REFUTE", "REFUTES", "REFUTED", "1"]:
+            return "Refute"
+        if label in ["NEI", "NOT_ENOUGH_INFO", "NOT ENOUGH INFO", "2", "UNVERIFIED"]:
+            return "NOT_ENOUGH_INFO"
+        return label.title() if label else "NOT_ENOUGH_INFO"
+
+    def _majority(verdicts: List[str]) -> str:
+        from collections import Counter
+        c = Counter(verdicts)
+        return c.most_common(1)[0][0] if c else "NOT_ENOUGH_INFO"
+
+    # X labels (include sample counts so early-stop doesn't look misleading)
+    rounds = ['Model\n(Baseline)']
+    for rn in round_nums:
+        total_key = f"round_{rn}_total"
+        n = round_accuracy_data.get(total_key)
+        if n is None:
+            rounds.append(f"Round {rn}\n(Majority)")
+        else:
+            rounds.append(f"Round {rn}\n(n={int(n)})")
+    rounds.append('Final\n(Judge)')
+
+    # Series:
+    # - reached_accuracy: the metric computed on samples that actually reached the round (subset)
+    # - carry_forward_accuracy: computed on ALL samples by carrying the last-available round verdict forward
+    reached_accuracy = [np.nan]
+    for rn in round_nums:
+        reached_accuracy.append(float(round_accuracy_data.get(f"round_{rn}_accuracy")))
+    final_acc = float(round_accuracy_data.get('final_accuracy', np.nan))
+    reached_accuracy.append(final_acc)
+
+    carry_forward_accuracy = None
+    if results:
+        total_all = 0
+        carry_correct_by_round = {rn: 0 for rn in round_nums}
+        
+        for r in results:
+            gold = _normalize_label(r.get("gold_label", ""))
+            if not gold or r.get("final_verdict") == "ERROR" or r.get("model_verdict") == "ERROR":
+                continue
+            debate_res = r.get("debate_result", {}) if isinstance(r.get("debate_result"), dict) else {}
+            all_rounds = debate_res.get("all_rounds_verdicts", [])
+            if not isinstance(all_rounds, list) or not all_rounds:
+                continue
+            total_all += 1
+
+            # Precompute majority verdict per available round, then carry forward
+            majority_per_round = []
+            for round_data in all_rounds:
+                if not isinstance(round_data, dict):
+                    majority_per_round.append("NOT_ENOUGH_INFO")
+                    continue
+                vs = [_normalize_label(v.get("verdict", "NOT_ENOUGH_INFO")) for v in round_data.values() if isinstance(v, dict)]
+                majority_per_round.append(_majority(vs))
+
+            for rn in round_nums:
+                idx = min(rn, len(majority_per_round)) - 1
+                pred = majority_per_round[idx]
+                if pred == gold:
+                    carry_correct_by_round[rn] += 1
+
+        if total_all > 0:
+            carry_forward_accuracy = [np.nan]
+            for rn in round_nums:
+                carry_forward_accuracy.append(carry_correct_by_round[rn] / total_all)
+            carry_forward_accuracy.append(final_acc)
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    x_pos = np.arange(len(rounds))
+
+    # Baseline point
+    baseline = model_accuracy / 100
+    ax.scatter([x_pos[0]], [baseline], s=120, color='#3498db', label='Model (Baseline)', zorder=3)
+    ax.text(x_pos[0], baseline + 0.015, f'{baseline:.1%}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    # Subset (reached-round) line
+    ax.plot(x_pos, reached_accuracy, marker='o', linewidth=3, markersize=10, color='#2ecc71', label='Reached-Round (Subset)')
+    for i, acc in enumerate(reached_accuracy):
+        if np.isnan(acc):
+            continue
+        ax.text(x_pos[i], acc + 0.015, f'{acc:.1%}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Carry-forward (all samples) line
+    if carry_forward_accuracy is not None:
+        ax.plot(x_pos, carry_forward_accuracy, marker='s', linewidth=2.5, markersize=8, color='#9b59b6', label='Carry-Forward (All Samples)')
+        for i, acc in enumerate(carry_forward_accuracy):
+            if np.isnan(acc):
+                continue
+            ax.text(x_pos[i], acc - 0.03, f'{acc:.1%}', ha='center', va='top', fontsize=9, color='#4a235a')
     
-    # Line plot
-    x_pos = range(len(rounds))
-    ax.plot(x_pos, accuracies, marker='o', linewidth=3, markersize=12, color='#2ecc71', label='Accuracy')
-    ax.fill_between(x_pos, 0, accuracies, alpha=0.2, color='#2ecc71')
-    
-    # Add value labels
-    for i, (r, acc) in enumerate(zip(rounds, accuracies)):
-        ax.text(i, acc + 0.015, f'{acc:.1%}', ha='center', va='bottom', fontsize=11, fontweight='bold')
-    
-    # Highlight improvement
-    if len(accuracies) > 1:
-        improvement = accuracies[-1] - accuracies[0]
-        ax.annotate('', xy=(len(rounds)-1, accuracies[-1]), xytext=(0, accuracies[0]),
-                   arrowprops=dict(arrowstyle='<->', color='red', lw=2))
-        mid_x = (len(rounds)-1) / 2
-        mid_y = (accuracies[0] + accuracies[-1]) / 2
-        ax.text(mid_x + 0.2, mid_y, f'+{improvement:.1%}', 
-               fontsize=12, fontweight='bold', color='red',
-               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Highlight baseline vs final (judge)
+    if not np.isnan(final_acc):
+        improvement = final_acc - baseline
+        ax.annotate('', xy=(x_pos[-1], final_acc), xytext=(x_pos[0], baseline),
+                    arrowprops=dict(arrowstyle='<->', color='red', lw=2))
+        mid_x = (x_pos[-1] + x_pos[0]) / 2
+        mid_y = (final_acc + baseline) / 2
+        ax.text(mid_x + 0.2, mid_y, f'{improvement:+.1%}',
+                fontsize=12, fontweight='bold', color='red',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     # Formatting
     ax.set_xticks(x_pos)
     ax.set_xticklabels(rounds, fontsize=11)
     ax.set_ylabel('Accuracy', fontsize=12)
-    ax.set_title(f'Accuracy Progression Across Rounds ({split_name.capitalize()})', fontsize=14, fontweight='bold')
-    ax.set_ylim(0, 1.25)  # Increased from 1.15 for labels
+    ax.set_title(f'Accuracy Across Rounds (Subset vs Carry-Forward) ({split_name.capitalize()})', fontsize=14, fontweight='bold')
+    ax.set_ylim(0, 1.25)  # Extra space for labels
     ax.grid(axis='y', alpha=0.3, linestyle='--')
     ax.legend(fontsize=11)
     
@@ -1288,7 +1364,6 @@ str(output_path / "confusion_matrix_final.png")
             split_name,
             str(output_path / "debator_performance.png")
         )
-    
     print(f"\n✅ All plots saved to: {output_dir}")
 
 
