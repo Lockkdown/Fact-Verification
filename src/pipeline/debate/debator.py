@@ -241,28 +241,16 @@ Your quote: "{own_prev_quote_str}"
 ---
 
 **TASK:**
-1. Identify 2-3 key parts of the claim you are debating
-2. For each agent you DISAGREE with, provide a rebuttal explaining the issue
-3. Decide: MAINTAIN your verdict unless there is STRONG counterevidence
+Write a short research-style rebuttal.
+1. State which parts of the claim you focus on.
+2. Compare your evidence against other agents' evidence (agree/disagree and why).
+3. Update your stance if and only if the evidence requires it.
 
-**RULES:**
-- Quotes must be copied VERBATIM from Evidence
-- For SUPPORTED: key_quote must be a verbatim quote that confirms the claim
-- For REFUTED: key_quote must be a verbatim quote that explicitly contradicts the claim
-- If no such quote exists, set verdict to NEI
-- If any agent has a different verdict, you MUST provide at least one rebuttal
-- Prefer debating the same key parts identified in Round 1 unless new key part is discovered
-
-**STABILITY & EVIDENCE-GATED UPDATE:**
-- Definition: a counter_quote is a VERBATIM quote from Evidence that directly SUPPORTS or directly REFUTES a debated key part of the Claim.
-- You may CHANGE your verdict only if you can cite a counter_quote that:
-  (1) directly targets a specific key part you listed in key_parts_checked, AND
-  (2) directly CONTRADICTS your previous quote/stance on that same key part (or directly CONFIRMS it if you previously had no supporting/contradicting quote), AND
-  (3) makes the previous interpretation untenable (not just "related" or "plausible").
-- If you do NOT introduce any new quote/counter_quote in this round, you must MAINTAIN your verdict.
-- Use a 2-step change process:
-  - CONSIDER_CHANGE: you found potential counterevidence, but you are not fully committed.
-  - CHANGE: only if the counterevidence is strong and you can clearly explain why it overturns your prior stance.
+**Evidence & Update Guidance:**
+- Use **verbatim quotes** copied from the Evidence.
+- Treat other agents' quotes as claims to be evaluated: is the quote relevant, and does it directly support/refute the claim?
+- **Maintain your verdict by default.** Change your verdict only if you introduce a **new counter_quote** (verbatim) that directly undermines your previous quote/interpretation on a specific claim part.
+- If you cannot find a clear, direct supporting/refuting quote for SUPPORTED/REFUTED, consider using NEI and briefly explain what is missing.
 
 **Output JSON:**
 {{
@@ -292,6 +280,32 @@ Your quote: "{own_prev_quote_str}"
         """Parse LLM response thành DebateArgument."""
         import json
         import re
+
+        def _maybe_warn_parse(msg: str):
+            # Rate-limit noisy parse warnings (avoid spamming console in large runs)
+            cnt = getattr(self, "_json_parse_fail_count", 0) + 1
+            setattr(self, "_json_parse_fail_count", cnt)
+            if cnt <= 3 or cnt % 50 == 0:
+                logger.warning(msg)
+
+        def _fallback_from_text(text: str, reason: str) -> DebateArgument:
+            verdict = "NEI"
+            confidence = 0.5
+            t = (text or "").upper()
+            if "REFUTED" in t or "REFUTE" in t or "SAI" in t:
+                verdict = "REFUTED"
+            elif "SUPPORTED" in t or "SUPPORT" in t or "ĐÚNG" in t or "DUNG" in t:
+                verdict = "SUPPORTED"
+            return DebateArgument(
+                debator_name=self.name,
+                role=self.role,
+                round_num=round_num,
+                verdict=verdict,
+                confidence=confidence,
+                reasoning=reason,
+                key_points=["Parse fallback"],
+                evidence_citations=[]
+            )
         
         # Clean response - remove markdown code blocks if present
         cleaned = response.strip()
@@ -330,18 +344,11 @@ Your quote: "{own_prev_quote_str}"
             json_str = cleaned
         
         if not json_str or '{' not in json_str:
-            logger.warning(f"{self.name}: Could not find JSON in response, using fallback")
-            # Log more of the response for debugging
-            logger.warning(f"{self.name} Raw response (first 300 chars): {response[:300]}")
-            return DebateArgument(
-                debator_name=self.name,
-                role=self.role,
-                round_num=round_num,
-                verdict="NEI",
-                confidence=0.5,
-                reasoning="Failed to parse response - no JSON found",
-                key_points=["Parse error"],
-                evidence_citations=[]
+            _maybe_warn_parse(f"{self.name}: Could not find JSON in response, using fallback")
+            _maybe_warn_parse(f"{self.name} Raw response (first 300 chars): {response[:300]}")
+            return _fallback_from_text(
+                response,
+                reason=f"Failed to parse response - no JSON found (fallback from text). Snippet: {response[:200]}..."
             )
         
         # Try to parse JSON, with repair attempts
@@ -464,7 +471,7 @@ Your quote: "{own_prev_quote_str}"
             # Extract reasoning - unified field: reasoning_vi
             reasoning = data.get("reasoning_vi") or data.get("reasoning") or data.get("final_reasoning_vi", "")
             
-            # Extract Round 2+ interaction fields (Dec 24, 2025 v2 - rebuttals format)
+            # Extract Round 2+ interaction fields (Dec 24, 2025 v2)
             agree_with = []
             disagree_with = []
             agree_reason = ""
@@ -552,29 +559,10 @@ Your quote: "{own_prev_quote_str}"
             )
         
         # Fallback: extract verdict from raw text
-        logger.warning(f"{self.name}: JSON parse failed, using fallback extraction")
-        
-        verdict = "NEI"
-        confidence = 0.5
-        reasoning = f"Parse error, extracted from text: {response[:200]}..."
-        
-        response_upper = response.upper()
-        if "REFUTED" in response_upper or "REFUTE" in response_upper:
-            verdict = "REFUTED"
-            confidence = 0.7
-        elif "SUPPORTED" in response_upper or "SUPPORT" in response_upper:
-            verdict = "SUPPORTED"
-            confidence = 0.7
-        
-        return DebateArgument(
-            debator_name=self.name,
-            role=self.role,
-            round_num=round_num,
-            verdict=verdict,
-            confidence=confidence,
-            reasoning=reasoning,
-            key_points=["Parse error - fallback extraction"],
-            evidence_citations=[]
+        _maybe_warn_parse(f"{self.name}: JSON parse failed, using fallback extraction")
+        return _fallback_from_text(
+            response,
+            reason=f"Parse error, extracted from text. Snippet: {response[:200]}..."
         )
 
 

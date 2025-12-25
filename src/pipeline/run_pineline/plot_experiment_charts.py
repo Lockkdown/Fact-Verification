@@ -31,6 +31,7 @@ class ExperimentResult:
     accuracy: float
     macro_f1: float
     avg_rounds: float
+    model_accuracy: Optional[float] = None
     avg_tokens: Optional[float] = None
     latency_p95: Optional[float] = None
     routed_to_debate_pct: Optional[float] = None  # Only for Hybrid
@@ -91,6 +92,40 @@ def load_experiment_results(results_dir: str, split: str = "test") -> List[Exper
                 if metrics_file.exists():
                     with open(metrics_file, 'r', encoding='utf-8') as f:
                         data = json.load(f)
+
+                    # Try to infer rounds distribution + avg rounds from round_by_round_accuracy
+                    rounds_dist = data.get('rounds_distribution', {})
+                    if not rounds_dist and isinstance(data.get('round_by_round_accuracy'), dict):
+                        rounds_dist = data['round_by_round_accuracy'].get('rounds_distribution', {}) or {}
+
+                    def _compute_avg_rounds(dist: Dict[Any, Any]) -> float:
+                        if not dist:
+                            return 0.0
+                        total = 0
+                        weighted = 0
+                        for k, v in dist.items():
+                            try:
+                                rk = int(k)
+                            except Exception:
+                                continue
+                            try:
+                                cnt = int(v)
+                            except Exception:
+                                continue
+                            total += cnt
+                            weighted += rk * cnt
+                        return (weighted / total) if total > 0 else 0.0
+
+                    avg_rounds_val = data.get('avg_rounds_used', data.get('avg_rounds', None))
+                    if avg_rounds_val is None or avg_rounds_val == 0:
+                        avg_rounds_val = _compute_avg_rounds(rounds_dist)
+
+                    # n_samples fallback: some metrics files only store totals under debate_impact or round_by_round_accuracy
+                    n_samples_val = data.get('total_samples', 0)
+                    if not n_samples_val and isinstance(data.get('debate_impact'), dict):
+                        n_samples_val = data['debate_impact'].get('total_analyzed', 0) or 0
+                    if not n_samples_val and isinstance(data.get('round_by_round_accuracy'), dict):
+                        n_samples_val = data['round_by_round_accuracy'].get('final_total', 0) or 0
                     
                     # Build setting name: e.g., "Full Fixed K=3" or "Hybrid EarlyStop max7"
                     mode_name = "Full" if debate_mode == "full_debate" else "Hybrid"
@@ -108,17 +143,18 @@ def load_experiment_results(results_dir: str, split: str = "test") -> List[Exper
                     
                     result = ExperimentResult(
                         setting_name=setting_name,
+                        model_accuracy=data.get('model_accuracy', None),
                         accuracy=data.get('final_accuracy', data.get('accuracy', 0)),
                         macro_f1=data.get('final_macro', {}).get('macro_f1', 0),
-                        avg_rounds=data.get('avg_rounds_used', data.get('avg_rounds', 1)),
+                        avg_rounds=float(avg_rounds_val) if avg_rounds_val is not None else 0.0,
                         avg_tokens=data.get('avg_tokens', None),
                         latency_p95=data.get('latency_p95', None),
                         routed_to_debate_pct=data.get('routed_to_debate_pct', None),
-                        rounds_distribution=data.get('rounds_distribution', {}),
+                        rounds_distribution=rounds_dist,
                         per_class_f1=data.get('per_class_f1', {}),
-                        n_samples=data.get('total_samples', 0),
+                        n_samples=int(n_samples_val) if n_samples_val else 0,
                         std_accuracy=data.get('std_accuracy', None),
-                        std_macro_f1=data.get('std_macro_f1', None),
+                        std_macro_f1=data.get('std_macro_f1', None)
                     )
                     results.append(result)
     
@@ -246,7 +282,7 @@ def generate_mock_data() -> List[ExperimentResult]:
 def plot_main_results_table(
     results: List[ExperimentResult],
     output_file: str,
-    title: str = "Main Results (9 Settings)"
+    title: str = "Main Results"
 ):
     """
     Create main results table as a figure.
@@ -305,8 +341,10 @@ def plot_main_results_table(
     for i in range(len(columns)):
         table[(best_acc_idx + 1, i)].set_facecolor('#d5f5e3')
     
-    plt.title(title, fontsize=16, fontweight='bold', pad=20)
-    plt.tight_layout()
+    # Dynamic title (avoid hardcoded "9 settings")
+    plt.title(f"{title} ({len(results)} Settings)", fontsize=16, fontweight='bold', pad=20)
+    # Reserve top space for legend
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -406,9 +444,12 @@ def plot_early_stopping_distribution(
     if len(es_results) == 1:
         axes = [axes]
     
-    colors = ['#9b59b6', '#1abc9c']
+    # Dynamic colors (avoid truncation when >2 settings)
+    colors = plt.cm.Set2(np.linspace(0.2, 0.9, len(es_results)))
     
-    for idx, (r, ax, color) in enumerate(zip(es_results, axes, colors)):
+    for idx, r in enumerate(es_results):
+        ax = axes[idx]
+        color = colors[idx]
         dist = r.rounds_distribution
         if not dist:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
@@ -452,7 +493,7 @@ def plot_early_stopping_distribution(
         ax.set_ylim(0, max(counts) * 1.25 if counts else 1)
         ax.grid(axis='y', alpha=0.3, linestyle='--')
     
-    plt.suptitle(title, fontsize=16, fontweight='bold', y=1.02)
+    plt.suptitle("EarlyStop: Rounds Used Distribution", fontsize=16, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
@@ -491,6 +532,7 @@ def plot_quality_vs_cost(
         'Hybrid EarlyStop': 'v',
     }
     
+    plotted_cats = set()
     for r in results:
         # Determine category
         if 'PhoBERT' in r.setting_name:
@@ -503,19 +545,47 @@ def plot_quality_vs_cost(
             cat = 'Hybrid Fixed'
         else:
             cat = 'Hybrid EarlyStop'
-        
-        ax.scatter(r.avg_rounds, r.macro_f1, 
-                   c=colors[cat], marker=markers[cat], s=200, 
-                   edgecolors='black', linewidths=1.5, alpha=0.8,
-                   label=cat if cat not in [l.get_label() for l in ax.collections] else '')
-        
-        # Label point
-        # Offset for readability
-        offset_x = 0.15
-        offset_y = 0.003
-        ax.annotate(r.setting_name.replace(' ', '\n'), 
-                    (r.avg_rounds + offset_x, r.macro_f1 + offset_y),
-                    fontsize=9, ha='left')
+
+        label = cat if cat not in plotted_cats else None
+        ax.scatter(
+            r.avg_rounds,
+            r.macro_f1,
+            c=colors[cat],
+            marker=markers[cat],
+            s=200,
+            edgecolors='black',
+            linewidths=1.5,
+            alpha=0.85,
+            label=label,
+            zorder=3,
+        )
+        plotted_cats.add(cat)
+
+        # Shorter label for readability in small-N quick runs
+        short_name = r.setting_name
+        if 'EarlyStop' in short_name and 'k' in short_name.lower():
+            # e.g., "Full EarlyStop k3" -> "k3"
+            import re
+            m = re.search(r'k(\d+)', short_name.lower())
+            if m:
+                short_name = f"k{m.group(1)}"
+
+        # Use offset-points (screen space) instead of data offsets to avoid labels going out-of-bounds
+        # Also adapt direction: rightmost points (e.g., k7) label to the left.
+        dx, dy = (10, 10)
+        if r.avg_rounds >= max([rr.avg_rounds for rr in results]) - 1e-6:
+            dx = -28
+        ax.annotate(
+            short_name,
+            (r.avg_rounds, r.macro_f1),
+            textcoords='offset points',
+            xytext=(dx, dy),
+            fontsize=10,
+            ha='left',
+            va='bottom',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='#444'),
+            zorder=4,
+        )
     
     # Formatting
     ax.set_xlabel('Average Rounds (Cost Proxy)', fontsize=14)
@@ -550,12 +620,8 @@ def plot_threshold_sweep(
     ]
     """
     if not threshold_data:
-        print("⚠️ No threshold sweep data, generating mock data")
-        # Mock data for testing
-        threshold_data = [
-            {"threshold": t, "macro_f1": 0.82 + 0.06 * (1 - t), "avg_rounds": 7 * (1 - t)}
-            for t in np.arange(0.1, 1.0, 0.1)
-        ]
+        print("⚠️ No threshold sweep data, skipping threshold sweep chart")
+        return
     
     thresholds = [d["threshold"] for d in threshold_data]
     f1_scores = [d["macro_f1"] for d in threshold_data]
@@ -625,15 +691,8 @@ def plot_bucket_analysis(
     ]
     """
     if not bucket_data:
-        print("⚠️ No bucket data, generating mock data")
-        bucket_data = [
-            {"bucket": "0.0-0.5", "phobert_f1": 0.48, "debate_f1": 0.65, "hybrid_f1": 0.65},
-            {"bucket": "0.5-0.6", "phobert_f1": 0.40, "debate_f1": 0.83, "hybrid_f1": 0.83},
-            {"bucket": "0.6-0.7", "phobert_f1": 0.63, "debate_f1": 0.78, "hybrid_f1": 0.78},
-            {"bucket": "0.7-0.8", "phobert_f1": 0.58, "debate_f1": 0.73, "hybrid_f1": 0.73},
-            {"bucket": "0.8-0.9", "phobert_f1": 0.75, "debate_f1": 0.79, "hybrid_f1": 0.77},
-            {"bucket": "0.9-1.0", "phobert_f1": 0.93, "debate_f1": 0.93, "hybrid_f1": 0.93},
-        ]
+        print("⚠️ No bucket data, skipping bucket analysis chart")
+        return
     
     buckets = [d["bucket"] for d in bucket_data]
     phobert_f1 = [d["phobert_f1"] for d in bucket_data]
@@ -673,6 +732,603 @@ def plot_bucket_analysis(
 
 
 # =============================================================================
+# NEW: Round-by-Round Accuracy (Dec 24, 2025)
+# =============================================================================
+def plot_round_by_round_accuracy_v2(
+    metrics_file: str,
+    results_file: str,
+    split_name: str,
+    output_file: str
+):
+    """
+    Vẽ biểu đồ round-by-round accuracy RÕ RÀNG cho early-stop debates.
+    
+    Strategy: CHỈ hiển thị Carry-Forward Accuracy (all samples) - không hiển thị subset
+    để tránh hiểu nhầm "R1 tốt nhất".
+    
+    Args:
+        metrics_file: Path to metrics_{split}.json
+        results_file: Path to {split}_results.json
+        split_name: Split name (dev/test) for title
+        output_file: Output PNG path
+    """
+    import json
+    from collections import Counter
+    
+    # Load data
+    with open(metrics_file, 'r', encoding='utf-8') as f:
+        metrics = json.load(f)
+    
+    with open(results_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+        results = data['results'] if isinstance(data, dict) and 'results' in data else data
+    
+    def _norm(label):
+        if not isinstance(label, str):
+            label = str(label)
+        label = label.upper().strip()
+        if label in ["SUPPORT", "SUPPORTS", "SUPPORTED", "0"]:
+            return "Support"
+        if label in ["REFUTE", "REFUTES", "REFUTED", "1"]:
+            return "Refute"
+        if label in ["NEI", "NOT_ENOUGH_INFO", "NOT ENOUGH INFO", "2", "UNVERIFIED"]:
+            return "NOT_ENOUGH_INFO"
+        return label.title() if label else "NOT_ENOUGH_INFO"
+    
+    def _majority(verdicts):
+        c = Counter(verdicts)
+        return c.most_common(1)[0][0] if c else "NOT_ENOUGH_INFO"
+    
+    # Detect available rounds
+    max_round = 0
+    for r in results:
+        debate_res = r.get("debate_result", {}) if isinstance(r.get("debate_result"), dict) else {}
+        all_rounds = debate_res.get("all_rounds_verdicts", [])
+        if isinstance(all_rounds, list):
+            max_round = max(max_round, len(all_rounds))
+    
+    if max_round == 0:
+        print("⚠️  No round data found, skipping round-by-round chart")
+        return
+    
+    # Compute carry-forward accuracy per round
+    total_valid = 0
+    correct_by_round = {r: 0 for r in range(1, max_round + 1)}
+    
+    for r in results:
+        gold = _norm(r.get("gold_label", ""))
+        if not gold or r.get("final_verdict") == "ERROR" or r.get("model_verdict") == "ERROR":
+            continue
+        
+        debate_res = r.get("debate_result", {}) if isinstance(r.get("debate_result"), dict) else {}
+        all_rounds = debate_res.get("all_rounds_verdicts", [])
+        if not isinstance(all_rounds, list) or not all_rounds:
+            continue
+        
+        total_valid += 1
+        
+        # Compute majority verdict per round (carry forward if stopped early)
+        majority_per_round = []
+        for round_data in all_rounds:
+            if not isinstance(round_data, dict):
+                majority_per_round.append("NOT_ENOUGH_INFO")
+                continue
+            vs = [_norm(v.get("verdict", "NOT_ENOUGH_INFO")) for v in round_data.values() if isinstance(v, dict)]
+            majority_per_round.append(_majority(vs))
+        
+        # Carry forward: each round uses the last available verdict
+        for round_num in range(1, max_round + 1):
+            idx = min(round_num, len(majority_per_round)) - 1
+            pred = majority_per_round[idx]
+            if pred == gold:
+                correct_by_round[round_num] += 1
+    
+    if total_valid == 0:
+        print("⚠️  No valid samples, skipping round-by-round chart")
+        return
+    
+    # Compute accuracy per round
+    rounds = list(range(1, max_round + 1))
+    accuracies = [correct_by_round[r] / total_valid for r in rounds]
+    
+    # Get model and final accuracy for comparison
+    model_acc = metrics.get("model_accuracy", 0.0)
+    final_acc = metrics.get("final_accuracy", 0.0)
+    
+    # Create bar chart
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Baseline and Final as reference lines
+    ax.axhline(y=model_acc, color='#3498db', linestyle='--', linewidth=2, label=f'Model Baseline ({model_acc:.1%})')
+    ax.axhline(y=final_acc, color='#e74c3c', linestyle='--', linewidth=2, label=f'Final (Judge) ({final_acc:.1%})')
+    
+    # Bars for each round
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(rounds)))
+    bars = ax.bar([f"R{r}" for r in rounds], accuracies, color=colors, edgecolor='black', linewidth=1.5, alpha=0.85)
+    
+    # Add value labels on bars
+    for bar, acc in zip(bars, accuracies):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, height + 0.01,
+                f'{acc:.1%}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+    
+    # Annotation
+    ax.text(0.02, 0.98, f'N = {total_valid} samples (carry-forward logic)',
+            transform=ax.transAxes, fontsize=11, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.6))
+    
+    ax.set_xlabel('Debate Round', fontsize=13)
+    ax.set_ylabel('Accuracy (All Samples)', fontsize=13)
+    ax.set_title(f'Round-by-Round Accuracy - Carry-Forward Strategy ({split_name.capitalize()})',
+                 fontsize=15, fontweight='bold')
+    ax.set_ylim(0, 1.1)
+    ax.legend(fontsize=11, loc='lower right')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📊 Saved round-by-round accuracy chart (v2): {output_file}")
+
+
+# =============================================================================
+# NEW: Consensus Evolution Chart (no selection bias)
+# =============================================================================
+def plot_consensus_evolution(results_file: str, split_name: str, output_file: str):
+    """
+    Plot consensus evolution: % samples reaching unanimous (3/3) verdict per round.
+    This metric is NOT affected by selection bias because it's computed on ALL samples.
+    """
+    # Load results
+    with open(results_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    results = data.get('results', data) if isinstance(data, dict) else data
+    if not isinstance(results, list):
+        print("⚠️  Invalid results format")
+        return
+    
+    # Find max rounds
+    max_round = 1
+    for r in results:
+        debate_res = r.get("debate_result", {}) if isinstance(r.get("debate_result"), dict) else {}
+        all_rounds = debate_res.get("all_rounds_verdicts", [])
+        if isinstance(all_rounds, list):
+            max_round = max(max_round, len(all_rounds))
+    
+    # Count unanimous per round using carry-forward (no selection bias)
+    unanimous_by_round = {rn: 0 for rn in range(1, max_round + 1)}
+    total_valid = 0
+    
+    for r in results:
+        debate_res = r.get("debate_result", {}) if isinstance(r.get("debate_result"), dict) else {}
+        all_rounds = debate_res.get("all_rounds_verdicts", [])
+        
+        if not isinstance(all_rounds, list) or not all_rounds:
+            continue
+        
+        total_valid += 1
+        
+        # Carry-forward: for rounds beyond early stop, reuse the last available round
+        last_round_data = all_rounds[-1] if all_rounds else {}
+        for round_num in range(1, max_round + 1):
+            if round_num <= len(all_rounds):
+                round_data = all_rounds[round_num - 1]
+            else:
+                round_data = last_round_data
+            
+            if isinstance(round_data, dict):
+                verdicts = [v.get("verdict", "").upper() for v in round_data.values() if isinstance(v, dict)]
+                # Unanimous = all 3 same verdict
+                if len(verdicts) >= 3 and len(set(verdicts)) == 1:
+                    unanimous_by_round[round_num] += 1
+    
+    if total_valid == 0:
+        print("⚠️  No valid samples, skipping consensus evolution chart")
+        return
+    
+    # Compute percentages
+    rounds = list(range(1, max_round + 1))
+    consensus_pct = [unanimous_by_round[r] / total_valid * 100 for r in rounds]
+    
+    # Create line chart
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    ax.plot(rounds, consensus_pct, marker='o', linewidth=2.5, markersize=10, 
+            color='#2ecc71', label='Unanimous (3/3)')
+    
+    # Add value labels
+    for r, pct in zip(rounds, consensus_pct):
+        ax.text(r, pct + 2, f'{pct:.1f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
+    
+    # Annotation
+    ax.text(0.02, 0.98, f'N = {total_valid} samples (carry-forward, no selection bias)',
+            transform=ax.transAxes, fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.6))
+    
+    ax.set_xlabel('Debate Round', fontsize=13)
+    ax.set_ylabel('% Samples with Unanimous Verdict', fontsize=13)
+    ax.set_title(f'Consensus Evolution - Debate Convergence ({split_name.capitalize()})',
+                 fontsize=14, fontweight='bold')
+    ax.set_xticks(rounds)
+    ax.set_xticklabels([f'R{r}' for r in rounds])
+    ax.set_ylim(0, 105)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.legend(fontsize=11)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📊 Saved consensus evolution chart: {output_file}")
+
+
+# =============================================================================
+# NEW: Compute Hybrid Cost Metrics (Dec 25, 2025)
+# =============================================================================
+def compute_hybrid_cost_metrics(results_file: str) -> Dict[str, Any]:
+    """
+    Compute cost metrics for Hybrid strategy from vifactcheck_test_results.json.
+    
+    Returns:
+        Dict with:
+        - total_samples: int
+        - skipped_count: int (Fast Path)
+        - debate_count: int (Slow Path)
+        - skip_ratio: float (% samples skipped)
+        - debate_ratio: float (% samples routed to debate)
+        - relative_cost: float (debate_ratio, cost relative to full debate = 1.0)
+        - threshold: float (threshold used)
+    """
+    import json
+    from pathlib import Path
+    
+    results_path = Path(results_file)
+    if not results_path.exists():
+        print(f"⚠️ Results file not found: {results_file}")
+        return {}
+    
+    with open(results_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    results = data.get('results', data) if isinstance(data, dict) else data
+    if not isinstance(results, list):
+        print("⚠️ Invalid results format")
+        return {}
+    
+    total_samples = len(results)
+    skipped_count = 0
+    debate_count = 0
+    threshold_used = None
+    
+    for r in results:
+        hybrid_info = r.get('hybrid_info', {})
+        if isinstance(hybrid_info, dict):
+            skipped = hybrid_info.get('skipped', False)
+            if skipped:
+                skipped_count += 1
+            else:
+                debate_count += 1
+            
+            # Extract threshold (should be same for all samples)
+            if threshold_used is None:
+                threshold_used = hybrid_info.get('threshold', None)
+    
+    skip_ratio = skipped_count / total_samples if total_samples > 0 else 0.0
+    debate_ratio = debate_count / total_samples if total_samples > 0 else 0.0
+    relative_cost = debate_ratio  # Cost relative to full debate (1.0)
+    
+    metrics = {
+        'total_samples': total_samples,
+        'skipped_count': skipped_count,
+        'debate_count': debate_count,
+        'skip_ratio': skip_ratio,
+        'debate_ratio': debate_ratio,
+        'relative_cost': relative_cost,
+        'threshold': threshold_used
+    }
+    
+    return metrics
+
+
+def print_hybrid_cost_summary(results_dir: str, split: str = 'test', configs: List[str] = None):
+    """
+    Print cost summary for hybrid configurations.
+    
+    Args:
+        results_dir: Base results directory (e.g., 'results/vifactcheck')
+        split: 'test' or 'dev'
+        configs: List of config names (e.g., ['earlystop_k3', 'earlystop_k5', 'earlystop_k7'])
+    """
+    from pathlib import Path
+    
+    results_path = Path(results_dir)
+    hybrid_dir = results_path / split / 'hybrid_debate'
+    
+    if not hybrid_dir.exists():
+        print(f"⚠️ Hybrid debate directory not found: {hybrid_dir}")
+        return
+    
+    if configs is None:
+        configs = ['earlystop_k3', 'earlystop_k5', 'earlystop_k7']
+    
+    print("\n" + "="*80)
+    print(f"HYBRID COST METRICS - {split.upper()} SET")
+    print("="*80)
+    print(f"{'Config':<20} {'Total':<10} {'Skip':<10} {'Debate':<10} {'Skip %':<12} {'Cost %':<12} {'Threshold':<10}")
+    print("-"*80)
+    
+    for config_name in configs:
+        config_dir = hybrid_dir / config_name
+        results_file = config_dir / f'vifactcheck_{split}_results.json'
+        
+        if not results_file.exists():
+            print(f"{config_name:<20} File not found")
+            continue
+        
+        metrics = compute_hybrid_cost_metrics(str(results_file))
+        
+        if not metrics:
+            print(f"{config_name:<20} Error computing metrics")
+            continue
+        
+        print(f"{config_name:<20} "
+              f"{metrics['total_samples']:<10} "
+              f"{metrics['skipped_count']:<10} "
+              f"{metrics['debate_count']:<10} "
+              f"{metrics['skip_ratio']*100:>10.2f}% "
+              f"{metrics['relative_cost']*100:>10.2f}% "
+              f"{metrics['threshold'] if metrics['threshold'] else 'N/A':<10}")
+    
+    print("="*80)
+    print("\n📊 Cost Interpretation:")
+    print("  - Skip %: Percentage of samples using Fast Path (model confidence high)")
+    print("  - Cost %: Percentage of samples requiring debate (Slow Path)")
+    print("  - Relative to Full Debate = 100% (all samples debated)")
+    print()
+
+
+# =============================================================================
+# NEW: Verdict Flip Rate Chart (no selection bias)
+# =============================================================================
+def plot_verdict_flip_rate(results_file: str, split_name: str, output_file: str):
+    """
+    Plot verdict flip rate: % samples where majority verdict changed between rounds.
+    Shows debate has actual impact on decisions.
+    """
+    # Load results
+    with open(results_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    results = data.get('results', data) if isinstance(data, dict) else data
+    if not isinstance(results, list):
+        print("⚠️  Invalid results format")
+        return
+    
+    def _norm(label):
+        if not isinstance(label, str):
+            label = str(label)
+        label = label.upper().strip()
+        if label in ["SUPPORT", "SUPPORTS", "SUPPORTED", "0"]:
+            return "SUPPORTED"
+        if label in ["REFUTE", "REFUTES", "REFUTED", "1"]:
+            return "REFUTED"
+        return "NEI"
+    
+    def _majority(verdicts):
+        from collections import Counter
+        c = Counter(verdicts)
+        return c.most_common(1)[0][0] if c else "NEI"
+    
+    # Find max rounds
+    max_round = 1
+    for r in results:
+        debate_res = r.get("debate_result", {}) if isinstance(r.get("debate_result"), dict) else {}
+        all_rounds = debate_res.get("all_rounds_verdicts", [])
+        if isinstance(all_rounds, list):
+            max_round = max(max_round, len(all_rounds))
+    
+    if max_round < 2:
+        print("⚠️  Need at least 2 rounds for flip rate chart")
+        return
+    
+    # Count flips per transition using carry-forward (no selection bias)
+    transitions = [f"R{r}→R{r+1}" for r in range(1, max_round)]
+    flip_counts = {t: 0 for t in transitions}
+    total_valid = 0
+    
+    for r in results:
+        debate_res = r.get("debate_result", {}) if isinstance(r.get("debate_result"), dict) else {}
+        all_rounds = debate_res.get("all_rounds_verdicts", [])
+        
+        if not isinstance(all_rounds, list) or not all_rounds:
+            continue
+        
+        total_valid += 1
+        
+        # Majority per available round
+        majorities = []
+        for round_data in all_rounds:
+            if isinstance(round_data, dict):
+                vs = [_norm(v.get("verdict", "NEI")) for v in round_data.values() if isinstance(v, dict)]
+                majorities.append(_majority(vs))
+            else:
+                majorities.append("NEI")
+        
+        # Carry-forward to max_round so every transition uses the same denominator
+        if len(majorities) < max_round:
+            majorities.extend([majorities[-1]] * (max_round - len(majorities)))
+        
+        # Check flips across all transitions
+        for i in range(max_round - 1):
+            trans = f"R{i+1}→R{i+2}"
+            if majorities[i] != majorities[i+1]:
+                flip_counts[trans] += 1
+    
+    if total_valid == 0:
+        print("⚠️  No valid samples, skipping flip rate chart")
+        return
+    
+    # Compute percentages
+    flip_pct = [flip_counts[t] / total_valid * 100 for t in transitions]
+    
+    # Create bar chart
+    # Wider figure to accommodate long transition labels (R1→R2, ...)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    colors = plt.cm.Oranges(np.linspace(0.4, 0.8, len(transitions)))
+    bars = ax.bar(transitions, flip_pct, color=colors, edgecolor='black', linewidth=1.5)
+    
+    # Add value labels
+    for bar, pct in zip(bars, flip_pct):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, height + 0.5,
+                f'{pct:.1f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
+    
+    # Annotation
+    ax.text(0.02, 0.98, f'N = {total_valid} samples (carry-forward)',
+            transform=ax.transAxes, fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.6))
+    
+    ax.set_xlabel('Round Transition', fontsize=13)
+    ax.set_ylabel('% Samples with Verdict Change', fontsize=13)
+    ax.set_title(f'Verdict Flip Rate - Debate Impact ({split_name.capitalize()})',
+                 fontsize=14, fontweight='bold')
+    # Avoid singular y-lims when all values are 0
+    max_val = max(flip_pct) if flip_pct else 0
+    if max_val <= 0:
+        ax.set_ylim(0, 5)
+    else:
+        ax.set_ylim(0, max_val * 1.3)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+
+    # Improve readability & avoid tight_layout warning
+    ax.tick_params(axis='x', labelrotation=20)
+
+    plt.tight_layout(pad=1.2)
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📊 Saved verdict flip rate chart: {output_file}")
+
+
+# =============================================================================
+# NEW: max_K Ablation Chart (replaces Fixed-K comparison)
+# =============================================================================
+def plot_maxk_ablation(results: List[ExperimentResult], output_file: str):
+    """
+    Plot max_K ablation: compare EarlyStop with different max_K values (3, 5, 7).
+    Replaces the old Fixed-K comparison chart.
+    """
+    # Filter for EarlyStop settings only
+    earlystop_results = [r for r in results if 'earlystop' in r.setting_name.lower()]
+    
+    if len(earlystop_results) < 2:
+        print("⚠️  Need at least 2 EarlyStop settings for max_K ablation")
+        return
+    
+    # Sort by max_K (extract from setting name)
+    def extract_k(setting_name):
+        import re
+        match = re.search(r'k(\d+)', setting_name.lower())
+        return int(match.group(1)) if match else 0
+    
+    earlystop_results.sort(key=lambda r: extract_k(r.setting_name))
+    
+    # Prepare data
+    settings = [r.setting_name for r in earlystop_results]
+    model_acc_pct = [((r.model_accuracy or 0.0) * 100) for r in earlystop_results]
+    final_acc_pct = [r.accuracy * 100 for r in earlystop_results]
+    macro_f1_pct = [r.macro_f1 * 100 for r in earlystop_results]
+    avg_rounds = [r.avg_rounds for r in earlystop_results]
+    
+    # Create figure with 2 y-axes
+    # Wider figure to accommodate legends + gain annotations
+    fig, ax1 = plt.subplots(figsize=(12, 6.8))
+    
+    x = np.arange(len(settings))
+    width = 0.35
+    
+    # Bars for model vs final accuracy + macro-F1
+    width = 0.25
+    bars0 = ax1.bar(x - width, model_acc_pct, width, label='Model Acc', color='#95a5a6', alpha=0.85)
+    bars1 = ax1.bar(x, final_acc_pct, width, label='Final Acc (Debate)', color='#3498db', alpha=0.85)
+    bars2 = ax1.bar(x + width, macro_f1_pct, width, label='Final Macro-F1', color='#2ecc71', alpha=0.85)
+    
+    ax1.set_xlabel('EarlyStop Setting (max_K)', fontsize=12)
+    ax1.set_ylabel('Quality (%)', fontsize=12)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([f'max_K={extract_k(s)}' for s in settings], fontsize=11)
+    ax1.set_ylim(0, 100)
+    
+    # Add value labels
+    for bar in bars0:
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=9)
+    for bar in bars1:
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=9)
+    for bar in bars2:
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=9)
+    
+    # Second y-axis for avg rounds
+    ax2 = ax1.twinx()
+    ax2.plot(
+        x,
+        avg_rounds,
+        marker='s',
+        color='#e74c3c',
+        linewidth=2,
+        markersize=8,
+        label='Avg Rounds',
+        alpha=0.9,
+        zorder=1,
+    )
+    ax2.set_ylabel('Avg Rounds', fontsize=12, color='#e74c3c')
+    ax2.tick_params(axis='y', labelcolor='#e74c3c')
+    # Place Avg Rounds legend above plot (avoid covering data)
+    ax2.legend(loc='upper right', bbox_to_anchor=(1.0, 1.18), fontsize=10, frameon=True)
+    
+    # Gain annotations: FinalAcc - ModelAcc
+    gains = [fa - ma for fa, ma in zip(final_acc_pct, model_acc_pct)]
+    for i, g in enumerate(gains):
+        y_pos = 98.0
+        if i == len(gains) - 1:
+            y_pos = 99.0
+        ax1.text(
+            x[i],
+            y_pos,
+            f"Gain: {g:+.1f}",
+            ha='center',
+            va='top',
+            fontsize=10,
+            fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='#444'),
+            zorder=10,
+        )
+
+    # Use a figure-level title + legend to avoid overlap/cropping across backends
+    fig.suptitle('max_K Ablation: Quality vs Cost (EarlyStop)', fontsize=14, fontweight='bold', y=0.98)
+    ax1.grid(axis='y', alpha=0.3, linestyle='--')
+
+    # Figure-level legend placed BELOW the title
+    handles = [bars0[0], bars1[0], bars2[0]]
+    labels = ['Model Acc', 'Final Acc (Debate)', 'Final Macro-F1']
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.93), ncol=3, fontsize=10, frameon=True)
+
+    # Reserve top space for title + legend
+    # Reserve more top space for title + 2 legends
+    fig.subplots_adjust(top=0.74)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📊 Saved max_K ablation chart: {output_file}")
+
+
+# =============================================================================
 # MAIN: Generate all charts
 # =============================================================================
 def generate_all_charts(
@@ -707,8 +1363,8 @@ def generate_all_charts(
     # 1. Main Results Table
     plot_main_results_table(results, str(output_path / "01_main_results_table.png"))
     
-    # 2. Fixed K comparison
-    plot_fixed_k_comparison(results, str(output_path / "02_fixed_k_comparison.png"))
+    # 2. max_K Ablation (replaces Fixed-K comparison)
+    plot_maxk_ablation(results, str(output_path / "02_maxk_ablation.png"))
     
     # 3. Early stopping distribution
     plot_early_stopping_distribution(results, str(output_path / "03_early_stopping_dist.png"))
@@ -722,8 +1378,15 @@ def generate_all_charts(
     # 6. Bucket analysis (nice-to-have)
     plot_bucket_analysis(bucket_data or [], str(output_path / "06_bucket_analysis.png"))
     
+    # Note: Consensus Evolution and Verdict Flip Rate charts require results_file path
+    # They should be called separately with: plot_consensus_evolution(results_file, split, output)
+    #                                        plot_verdict_flip_rate(results_file, split, output)
+    
     print(f"\n✅ All charts generated in: {output_dir}")
     print(f"📊 Total settings compared: {len(results)}")
+    print(f"💡 For Consensus Evolution & Verdict Flip Rate, call:")
+    print(f"   plot_consensus_evolution(results_file, split_name, output_file)")
+    print(f"   plot_verdict_flip_rate(results_file, split_name, output_file)")
 
 
 def main():

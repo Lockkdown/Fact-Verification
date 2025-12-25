@@ -522,6 +522,7 @@ def _build_result(sample: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, A
         "final_verdict_norm": final_verdict_norm,
         "model_correct": model_correct,
         "final_correct": final_correct,
+        "hybrid_info": result.get("hybrid_info"),
         "debate_info": debate_info,
         "debate_result": debate_result,
         "verdict_3label_probs": result.get("model_probs")
@@ -1019,17 +1020,6 @@ def main():
         action="store_true",
         help="Run all max_rounds configs (3, 5, 7) and generate comparison report"
     )
-    parser.add_argument(
-        "--run-both-modes",
-        action="store_true",
-        help="Run BOTH early-stop and fixed modes for the selected max_rounds configs (scope: 3, 5, 7)"
-    )
-    parser.add_argument(
-        "--fixed",
-        action="store_true",
-        help="Fixed rounds mode: run exactly K rounds without early stopping (default: early stop enabled)"
-    )
-    
     # Checkpoint/Resume
     parser.add_argument(
         "--checkpoint-every",
@@ -1137,13 +1127,14 @@ def main():
     config.use_async_debate = args.async_debate
     
     # Determine max_rounds configs to run
-    if args.run_all_configs or args.run_both_modes:
+    if args.run_all_configs:
         # Scope-aligned (Dec 2025): Only 3-5-7
         max_rounds_configs = ["3", "5", "7"]
     elif args.max_rounds:
         max_rounds_configs = args.max_rounds
     else:
-        max_rounds_configs = [None]  # Use config file value (single run)
+        # Default: use config file value (single run)
+        max_rounds_configs = ["default"]
     
     debate_mode_folder = "hybrid_debate" if args.hybrid_subdir else "full_debate"
     
@@ -1180,11 +1171,9 @@ def main():
     adaptive_threshold = 0.06  # 6% threshold
     configs_to_run = []
 
-    # If running both modes in one command, do NOT use adaptive scheduling.
-    # We want full coverage: (earlystop + fixed) x (3,5,7)
-    if args.run_both_modes:
-        configs_to_run = max_rounds_configs
-    elif args.run_all_configs:
+    # Dec 24, 2025: Fixed mode removed, only EarlyStop supported
+    # Focus: EarlyStop max_K={3,5,7}
+    if args.run_all_configs:
         # Adaptive mode: Start with 3, add more configs based on hit_cap_rate
         configs_to_run = ["3"]  # Always start with 3
         logger.info(f"\n🎯 ADAPTIVE STRATEGY: Starting with max_rounds=3")
@@ -1192,172 +1181,189 @@ def main():
     else:
         configs_to_run = max_rounds_configs
 
-    # Determine which debate execution modes to run
-    modes_to_run = [args.fixed]
-    if args.run_both_modes:
-        modes_to_run = [False, True]  # earlystop then fixed
+    # Dec 24, 2025: Only EarlyStop mode (fixed_mode=False)
+    # Fixed mode removed from scope due to cost constraints
+    fixed_mode = False  # Always EarlyStop
 
-    # Loop through modes x max_rounds configs
-    for fixed_mode in modes_to_run:
-        # Loop through max_rounds configs
-        for idx, max_rounds_str in enumerate(configs_to_run):
-            if max_rounds_str is not None:
-                max_rounds = parse_max_rounds_arg(max_rounds_str)
-                update_debate_config(max_rounds, fixed_mode=fixed_mode)
-                config_name = max_rounds_str
+    # Loop through max_rounds configs (EarlyStop only)
+    for idx, max_rounds_str in enumerate(configs_to_run):
+        if max_rounds_str is not None:
+            max_rounds = parse_max_rounds_arg(max_rounds_str)
+            update_debate_config(max_rounds, fixed_mode=fixed_mode)
+            config_name = max_rounds_str
+        else:
+            config_name = "default"
+        
+        # Mode prefix for folder naming (Dec 24, 2025: EarlyStop only)
+        mode_prefix = "earlystop"
+        mode_display = f"EARLYSTOP max={config_name}"
+        
+        logger.info(f"\n{'#'*80}")
+        logger.info(f"CONFIG: {mode_display}".center(80))
+        logger.info(f"{'#'*80}")
+        
+        # Unique key for comparison report
+        config_key = f"{mode_prefix}_{config_name}"
+        all_experiment_results[config_key] = {}
+
+        # Process each split for this config
+        for split in args.splits:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"Processing {split.upper()} split ({mode_display})".center(80))
+            logger.info(f"{'='*80}\n")
+            
+            # Determine output directory for this split + config
+            # Structure: results/vifactcheck/{split}/{debate_mode}/{mode_prefix}_k{rounds}/
+            if config_name in ['none', 'inf', 'default']:
+                config_folder = f"{mode_prefix}_k7"  # Safety default
             else:
-                config_name = "default"
+                config_folder = f"{mode_prefix}_k{config_name}"
             
-            # Determine mode prefix for folder naming (Dec 24, 2025 - align with scope)
-            if fixed_mode:
-                mode_prefix = "fixed"
-                mode_display = f"FIXED K={config_name}"
+            if args.hybrid_subdir:
+                split_output_dir = args.output_dir / split / "hybrid_debate" / config_folder
             else:
-                mode_prefix = "earlystop"
-                mode_display = f"EARLYSTOP max={config_name}"
+                split_output_dir = args.output_dir / split / "full_debate" / config_folder
             
-            logger.info(f"\n{'#'*80}")
-            logger.info(f"CONFIG: {mode_display}".center(80))
-            logger.info(f"{'#'*80}")
+            # Run pipeline
+            split_results = run_pipeline_on_split(
+                split=split,
+                config=config,
+                checkpoint_every=args.checkpoint_every,
+                resume=args.resume,
+                output_dir=split_output_dir,
+                max_samples=args.max_samples,
+                batch_size=args.batch_size,
+                quiet=args.quiet
+            )
             
-            # Unique key so comparison report can include both modes
-            config_key = f"{mode_prefix}_{config_name}"
-            all_experiment_results[config_key] = {}
+            # Save results
+            saved_files = save_results(split_results, split, split_output_dir, skip_split_subdir=True)
+            
+            # Store for comparison report
+            all_experiment_results[config_key][split] = split_results
 
-            # Process each split for this config
-            for split in args.splits:
-                logger.info(f"\n{'='*80}")
-                logger.info(f"Processing {split.upper()} split ({mode_display})".center(80))
-                logger.info(f"{'='*80}\n")
-                
-                # Determine output directory for this split + config
-                # Structure: results/vifactcheck/{split}/{debate_mode}/{mode_prefix}_k{rounds}/
-                # Dec 24, 2025: folder naming aligned with scope (fixed_k3, earlystop_k7, etc.)
-                if config_name in ['none', 'inf', 'default']:
-                    config_folder = f"{mode_prefix}_k7"  # Safety default
-                else:
-                    config_folder = f"{mode_prefix}_k{config_name}"
-                
-                if args.hybrid_subdir:
-                    split_output_dir = args.output_dir / split / "hybrid_debate" / config_folder
-                else:
-                    split_output_dir = args.output_dir / split / "full_debate" / config_folder
-                
-                # Run pipeline
-                split_results = run_pipeline_on_split(
-                    split=split,
-                    config=config,
-                    checkpoint_every=args.checkpoint_every,
-                    resume=args.resume,
-                    output_dir=split_output_dir,
-                    max_samples=args.max_samples,
-                    batch_size=args.batch_size,
-                    quiet=args.quiet
-                )
-                
-                # Save results
-                saved_files = save_results(split_results, split, split_output_dir, skip_split_subdir=True)
-                
-                # Store for comparison report
-                all_experiment_results[config_key][split] = split_results
+            # Run evaluation & plots (default: True, skip if --no-report)
+            if args.full_report and not args.no_report:
+                logger.info(f"\n📊 Generating metrics & plots for {split}...")
+                try:
+                    # Step 1: Call evaluate_results.py to compute metrics
+                    import subprocess
+                    eval_script = Path(__file__).parent / "evaluate_results.py"
+                    result_file = saved_files["full_results"]
+                    
+                    # Create metrics directory and set proper metrics file path
+                    metrics_dir = split_output_dir / "metrics"
+                    metrics_dir.mkdir(parents=True, exist_ok=True)
+                    metrics_file = metrics_dir / f"metrics_{split}.json"
+                    
+                    subprocess.run([
+                        sys.executable,
+                        str(eval_script),
+                        str(result_file),
+                        "--save-metrics",
+                        str(metrics_file)
+                    ], check=True)
+                    
+                    logger.info(f"✅ Metrics saved to: {metrics_file}")
+                    
+                    # Print metrics summary to console
+                    logger.info(f"\n📊 ===== METRICS SUMMARY ({split.upper()}) =====")
+                    with open(metrics_file, 'r', encoding='utf-8') as f:
+                        metrics = json.load(f)
+                    
+                    logger.info(f"\n📈 Overall:")
+                    logger.info(f"  Model Accuracy:  {metrics['model_accuracy']:.2%}")
+                    logger.info(f"  Final Accuracy:  {metrics['final_accuracy']:.2%}")
+                    
+                    logger.info(f"\n📊 Final Macro-Averaged:")
+                    final_macro = metrics["final_macro"]
+                    logger.info(f"  Precision: {final_macro['macro_precision']:.4f}")
+                    logger.info(f"  Recall:    {final_macro['macro_recall']:.4f}")
+                    logger.info(f"  F1:        {final_macro['macro_f1']:.4f}")
+                    
+                    logger.info(f"\n📋 Per-Class (Final):")
+                    logger.info(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
+                    logger.info("-" * 70)
+                    for label, m in metrics["final_per_class"].items():
+                        logger.info(f"{label:<20} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1']:>10.4f} {m['support']:>10}")
+                    
+                    if metrics.get("debate_impact"):
+                        debate = metrics["debate_impact"]
+                        logger.info(f"\n💬 Debate Impact:")
+                        logger.info(f"  Fixed:  {debate['fixed']} samples ({debate['fix_rate']:.2f}%)")
+                        logger.info(f"  Broken: {debate['broken']} samples ({debate['break_rate']:.2f}%)")
+                    
+                    logger.info(f"\n{'='*80}\n")
+                    
+                    # Step 2: Generate plots using plot_metrics.py
+                    logger.info(f"\n📈 Generating plots for {split}...")
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location(
+                        "plot_metrics",
+                        Path(__file__).parent / "plot_metrics.py"
+                    )
+                    plot_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(plot_module)
+                    
+                    with open(metrics_file, 'r', encoding='utf-8') as f:
+                        metrics = json.load(f)
+                    
+                    charts_dir = split_output_dir / "charts"
+                    plot_module.generate_all_plots(metrics, split_results["results"], split.upper(), charts_dir)
+                    logger.info(f"✅ All plots saved to: {charts_dir}/")
 
-                # Run evaluation & plots (default: True, skip if --no-report)
-                if args.full_report and not args.no_report:
-                    logger.info(f"\n📊 Generating metrics & plots for {split}...")
+                    # Step 3: Experiment-level (per-config) charts (Dec 2025)
+                    # Consensus Evolution + Verdict Flip Rate (no selection bias)
                     try:
-                        # Step 1: Call evaluate_results.py to compute metrics
-                        import subprocess
-                        eval_script = Path(__file__).parent / "evaluate_results.py"
-                        result_file = saved_files["full_results"]
-                        
-                        # Create metrics directory and set proper metrics file path
-                        metrics_dir = split_output_dir / "metrics"
-                        metrics_dir.mkdir(parents=True, exist_ok=True)
-                        metrics_file = metrics_dir / f"metrics_{split}.json"
-                        
-                        subprocess.run([
-                            sys.executable,
-                            str(eval_script),
-                            str(result_file),
-                            "--save-metrics",
-                            str(metrics_file)
-                        ], check=True)
-                        
-                        logger.info(f"✅ Metrics saved to: {metrics_file}")
-                        
-                        # Print metrics summary to console
-                        logger.info(f"\n📊 ===== METRICS SUMMARY ({split.upper()}) =====")
-                        with open(metrics_file, 'r', encoding='utf-8') as f:
-                            metrics = json.load(f)
-                        
-                        logger.info(f"\n📈 Overall:")
-                        logger.info(f"  Model Accuracy:  {metrics['model_accuracy']:.2%}")
-                        logger.info(f"  Final Accuracy:  {metrics['final_accuracy']:.2%}")
-                        
-                        logger.info(f"\n📊 Final Macro-Averaged:")
-                        final_macro = metrics["final_macro"]
-                        logger.info(f"  Precision: {final_macro['macro_precision']:.4f}")
-                        logger.info(f"  Recall:    {final_macro['macro_recall']:.4f}")
-                        logger.info(f"  F1:        {final_macro['macro_f1']:.4f}")
-                        
-                        logger.info(f"\n📋 Per-Class (Final):")
-                        logger.info(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
-                        logger.info("-" * 70)
-                        for label, m in metrics["final_per_class"].items():
-                            logger.info(f"{label:<20} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1']:>10.4f} {m['support']:>10}")
-                        
-                        if metrics.get("debate_impact"):
-                            debate = metrics["debate_impact"]
-                            logger.info(f"\n💬 Debate Impact:")
-                            logger.info(f"  Fixed:  {debate['fixed']} samples ({debate['fix_rate']:.2f}%)")
-                            logger.info(f"  Broken: {debate['broken']} samples ({debate['break_rate']:.2f}%)")
-                        
-                        logger.info(f"\n{'='*80}\n")
-                        
-                        # Step 2: Generate plots using plot_metrics.py
-                        logger.info(f"\n📈 Generating plots for {split}...")
                         import importlib.util
-                        spec = importlib.util.spec_from_file_location(
-                            "plot_metrics",
-                            Path(__file__).parent / "plot_metrics.py"
+                        pec_spec = importlib.util.spec_from_file_location(
+                            "plot_experiment_charts",
+                            Path(__file__).parent / "plot_experiment_charts.py"
                         )
-                        plot_module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(plot_module)
-                        
-                        with open(metrics_file, 'r', encoding='utf-8') as f:
-                            metrics = json.load(f)
-                        
-                        charts_dir = split_output_dir / "charts"
-                        plot_module.generate_all_plots(metrics, split_results["results"], split.upper(), charts_dir)
-                        logger.info(f"✅ All plots saved to: {charts_dir}/")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Could not generate metrics/plots: {e}")
-                        import traceback
-                        traceback.print_exc()
+                        pec_module = importlib.util.module_from_spec(pec_spec)
+                        pec_spec.loader.exec_module(pec_module)
 
-            # Adaptive strategy: Check if we need to run higher rounds
-            # Only apply to single-mode run-all-configs (not run-both-modes)
-            if (not args.run_both_modes) and args.run_all_configs and idx == len(configs_to_run) - 1:
-                all_splits_results = []
-                for split_name, split_data in all_experiment_results[config_key].items():
-                    if split_data.get("results"):
-                        all_splits_results.extend(split_data["results"])
-                
-                if all_splits_results:
-                    metrics = analyze_debate_metrics(all_splits_results)
-                    hit_cap_rate = metrics.get("hit_cap_rate", 0)
-                    logger.info(f"\n📊 ADAPTIVE DECISION for max_rounds={config_name}:")
-                    logger.info(f"   hit_cap_rate = {hit_cap_rate:.1%}")
-                    if hit_cap_rate >= adaptive_threshold:
-                        next_config_map = {"3": "5", "5": "7"}
-                        next_config = next_config_map.get(config_name)
-                        if next_config:
-                            configs_to_run.append(next_config)
-                            logger.info(f"   ✅ hit_cap_rate >= {adaptive_threshold:.0%} → Adding max_rounds={next_config}")
-                        else:
-                            logger.info(f"   ⏹️  Already at max_rounds=7, no higher config available")
+                        pec_module.plot_consensus_evolution(
+                            results_file=str(result_file),
+                            split_name=split,
+                            output_file=str(charts_dir / "consensus_evolution.png")
+                        )
+                        pec_module.plot_verdict_flip_rate(
+                            results_file=str(result_file),
+                            split_name=split,
+                            output_file=str(charts_dir / "verdict_flip_rate.png")
+                        )
+                        logger.info(f"✅ Consensus/Flip charts saved to: {charts_dir}/")
+                    except Exception as e:
+                        logger.warning(f"⚠️  Could not generate consensus/flip charts: {e}")
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not generate metrics/plots: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+        # Adaptive strategy: Check if we need to run higher rounds
+        # Dec 24, 2025: Simplified - only EarlyStop mode
+        if args.run_all_configs and idx == len(configs_to_run) - 1:
+            all_splits_results = []
+            for split_name, split_data in all_experiment_results[config_key].items():
+                if split_data.get("results"):
+                    all_splits_results.extend(split_data["results"])
+            
+            if all_splits_results:
+                metrics = analyze_debate_metrics(all_splits_results)
+                hit_cap_rate = metrics.get("hit_cap_rate", 0)
+                logger.info(f"\n📊 ADAPTIVE DECISION for max_rounds={config_name}:")
+                logger.info(f"   hit_cap_rate = {hit_cap_rate:.1%}")
+                if hit_cap_rate >= adaptive_threshold:
+                    next_config_map = {"3": "5", "5": "7"}
+                    next_config = next_config_map.get(config_name)
+                    if next_config:
+                        configs_to_run.append(next_config)
+                        logger.info(f"   ✅ hit_cap_rate >= {adaptive_threshold:.0%} → Adding max_rounds={next_config}")
                     else:
-                        logger.info(f"   ⏹️  hit_cap_rate < {adaptive_threshold:.0%} → Stopping adaptive strategy")
+                        logger.info(f"   ⏹️  Already at max_rounds=7, no higher config available")
+                else:
+                    logger.info(f"   ⏹️  hit_cap_rate < {adaptive_threshold:.0%} → Stopping adaptive strategy")
 
     # Calibration workflow
     if args.calibration and "dev" in args.splits and "test" in args.splits:
@@ -1373,6 +1379,44 @@ def main():
     if len(max_rounds_configs) > 1:
         debate_mode = "hybrid_debate" if args.hybrid_subdir else "full_debate"
         generate_comparison_report(all_experiment_results, args.output_dir, debate_mode)
+
+        # Also generate experiment-level charts (Dec 2025)
+        # Saved under: results/vifactcheck/{split}/{debate_mode}/comparison_report/charts/
+        if args.full_report and not args.no_report:
+            try:
+                import importlib.util
+                pec_spec = importlib.util.spec_from_file_location(
+                    "plot_experiment_charts",
+                    Path(__file__).parent / "plot_experiment_charts.py"
+                )
+                pec_module = importlib.util.module_from_spec(pec_spec)
+                pec_spec.loader.exec_module(pec_module)
+
+                for split in args.splits:
+                    experiment_results = pec_module.load_experiment_results(str(args.output_dir), split=split)
+
+                    # Filter to this debate_mode + earlystop only
+                    if debate_mode == "full_debate":
+                        experiment_results = [r for r in experiment_results if r.setting_name.lower().startswith("full")]
+                    else:
+                        experiment_results = [r for r in experiment_results if r.setting_name.lower().startswith("hybrid")]
+
+                    experiment_results = [r for r in experiment_results if "earlystop" in r.setting_name.lower()]
+
+                    out_dir = args.output_dir / split / debate_mode / "comparison_report" / "charts"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Generate full chart set (01-06). Threshold/bucket charts will be skipped
+                    # automatically when no data is provided.
+                    pec_module.generate_all_charts(
+                        results=experiment_results,
+                        output_dir=str(out_dir),
+                        threshold_data=None,
+                        bucket_data=None,
+                    )
+                    logger.info(f"✅ Experiment charts saved to: {out_dir}/")
+            except Exception as e:
+                logger.warning(f"⚠️  Could not generate experiment charts: {e}")
     
     # Final summary
     logger.info("\n" + "="*80)

@@ -160,7 +160,8 @@ def analyze_hybrid_strategy(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     debated = 0
     skipped_correct = 0
     debated_correct = 0
-    threshold = 0.85  # Default
+    threshold = None
+    hybrid_active = False
     
     for r in results:
         if r.get("model_verdict") == "ERROR" or r.get("final_verdict") == "ERROR":
@@ -168,10 +169,17 @@ def analyze_hybrid_strategy(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         
         total += 1
         hybrid_info = r.get("hybrid_info", {})
+        if hybrid_info and isinstance(hybrid_info, dict) and (
+            hybrid_info.get("source") is not None or
+            hybrid_info.get("threshold") is not None or
+            hybrid_info.get("skipped") is not None
+        ):
+            hybrid_active = True
         
         if hybrid_info.get("skipped", False) or hybrid_info.get("source") == "MODEL_HIGH_CONF":
             skipped += 1
-            threshold = hybrid_info.get("threshold", 0.85)
+            if hybrid_info.get("threshold") is not None:
+                threshold = hybrid_info.get("threshold")
             if r.get("final_correct", False):
                 skipped_correct += 1
         elif r.get("debate_info") or r.get("debate_result"):
@@ -185,6 +193,7 @@ def analyze_hybrid_strategy(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 skipped_correct += 1
     
     return {
+        "active": hybrid_active,
         "total": total,
         "threshold": threshold,
         "skipped": skipped,
@@ -574,8 +583,8 @@ def print_metrics_report(metrics: Dict[str, Any]):
     
     # Overall accuracy
     print("\n📊 Overall Metrics:")
-    print(f"  Model Accuracy (pre-debate):  {metrics['model_accuracy']:.2f}%")
-    print(f"  Final Accuracy (post-debate): {metrics['final_accuracy']:.2f}%")
+    print(f"  Model Accuracy (pre-debate):  {metrics['model_accuracy']:.2%}")
+    print(f"  Final Accuracy (post-debate): {metrics['final_accuracy']:.2%}")
     
     # Macro metrics
     print(f"\n📈 Macro-Averaged Metrics (Model):")
@@ -621,7 +630,7 @@ def print_metrics_report(metrics: Dict[str, Any]):
     # Hybrid Strategy Stats (DOWN Framework)
     if metrics.get("hybrid_strategy"):
         hybrid = metrics["hybrid_strategy"]
-        if hybrid.get("debated", 0) > 0:  # Only show if hybrid mode was active
+        if hybrid.get("active") and hybrid.get("debated", 0) > 0:  # Only show if hybrid mode was active
             print(f"\n🚀 Hybrid Strategy (DOWN Framework):")
             print(f"  Threshold:          {hybrid['threshold']}")
             print(f"  Skipped (high conf): {hybrid['skipped']}/{hybrid['total']} ({hybrid['skipped_ratio']:.1f}%)")
@@ -640,21 +649,10 @@ def print_metrics_report(metrics: Dict[str, Any]):
         print(f"  Broken:             {debate['broken']} (model ✓ → final ✗) - {debate['break_rate']:.2f}%")
         print(f"  Kept incorrect:     {debate['kept_incorrect']} (model ✗ → final ✗)")
     
-    # Round-by-Round Accuracy (scope-aligned Dec 2025)
+    # Round-by-Round Accuracy is omitted from console output due to selection bias in EarlyStop.
+    # (Still computed and saved under metrics['round_by_round_accuracy'] for debugging.)
     if metrics.get("round_by_round_accuracy"):
-        round_acc = metrics["round_by_round_accuracy"]
-        print(f"\n📊 Round-by-Round Accuracy:")
-        # Dynamic multi-round display
-        for i in range(1, 10):  # Support up to 9 rounds
-            key = f"round_{i}_accuracy"
-            if key in round_acc:
-                print(f"  Round {i} Majority Vote:    {round_acc[key]:.2%} ({round_acc.get(f'round_{i}_correct', 0)}/{round_acc.get(f'round_{i}_total', 0)})")
-        if "final_accuracy" in round_acc:
-            print(f"  Final (Judge):            {round_acc['final_accuracy']:.2%} ({round_acc['final_correct']}/{round_acc['final_total']})")
-        if "improvement_r1_to_final" in round_acc:
-            imp = round_acc['improvement_r1_to_final']
-            emoji = "📈" if imp > 0 else "📉" if imp < 0 else "➡️"
-            print(f"  {emoji} Improvement (R1→Final): {imp:+.2%}")
+        print("\n📊 Round-by-Round Accuracy: omitted (selection bias under EarlyStop)")
     
     # Model Calibration (ECE, Brier Score)
     if metrics.get("model_calibration"):

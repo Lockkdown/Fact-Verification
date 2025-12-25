@@ -121,6 +121,7 @@ class AdaptiveDebateOrchestrator:
         hybrid_config = self.debate_config.get('hybrid_strategy', {})
         self.hybrid_enabled = hybrid_config.get('enabled', True)
         self.hybrid_threshold = hybrid_config.get('default_threshold', 0.85)
+        self.per_policy_thresholds = hybrid_config.get('per_policy_thresholds', {})
         self.hybrid_strategy = HybridStrategy(threshold=self.hybrid_threshold)
         logger.info(f"Hybrid Strategy: {'ENABLED' if self.hybrid_enabled else 'DISABLED'} (threshold={self.hybrid_threshold})")
     
@@ -134,6 +135,58 @@ class AdaptiveDebateOrchestrator:
         self.hybrid_threshold = threshold
         self.hybrid_strategy = HybridStrategy(threshold=threshold)
         logger.info(f"Hybrid threshold updated to: {threshold}")
+    
+    def load_threshold_for_policy(self, policy_name: str = None) -> float:
+        """
+        Load optimal threshold for a specific policy from optimal_threshold.json.
+        
+        Option A (Dec 24, 2025): Per-policy threshold tuning.
+        
+        Args:
+            policy_name: e.g., "earlystop_k3", "earlystop_k5", "earlystop_k7"
+                        If None, uses default_policy from config.
+        
+        Returns:
+            Threshold value (uses default if policy not found)
+        """
+        config_path = Path(__file__).parent.parent.parent.parent / "config" / "debate" / "optimal_threshold.json"
+        
+        if not config_path.exists():
+            logger.warning(f"optimal_threshold.json not found. Using default threshold: {self.hybrid_threshold}")
+            return self.hybrid_threshold
+        
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                threshold_config = json.load(f)
+            
+            # Check version - v2.0 has per-policy thresholds
+            version = threshold_config.get('version', '1.0')
+            
+            if version == '2.0':
+                # Option A: Per-policy thresholds
+                policies = threshold_config.get('policies', {})
+                
+                if policy_name and policy_name in policies:
+                    threshold = policies[policy_name]['threshold']
+                    logger.info(f"Loaded threshold for {policy_name}: {threshold}")
+                else:
+                    # Use default policy
+                    default_policy = threshold_config.get('default_policy', 'earlystop_k5')
+                    threshold = threshold_config.get('default_threshold', self.hybrid_threshold)
+                    logger.info(f"Using default threshold ({default_policy}): {threshold}")
+                
+                self.set_hybrid_threshold(threshold)
+                return threshold
+            else:
+                # Legacy v1.0: single threshold
+                threshold = threshold_config.get('optimal_threshold', self.hybrid_threshold)
+                logger.info(f"Loaded legacy threshold: {threshold}")
+                self.set_hybrid_threshold(threshold)
+                return threshold
+                
+        except Exception as e:
+            logger.warning(f"Error loading threshold: {e}. Using default: {self.hybrid_threshold}")
+            return self.hybrid_threshold
     
     async def close(self):
         """Close all resources."""
