@@ -495,7 +495,7 @@ class AdaptiveDebateOrchestrator:
                     "role": arg.role
                 }
         
-        # Build all_rounds_verdicts (Dec 24, 2025 - include debate interaction fields)
+        # Build all_rounds_verdicts (Dec 24, 2025 - include all structured fields)
         all_rounds_verdicts = []
         for round_args in debate_history:
             round_data = {}
@@ -504,14 +504,21 @@ class AdaptiveDebateOrchestrator:
                     "verdict": arg.verdict,
                     "confidence": arg.confidence,
                     "reasoning": arg.reasoning,
-                    "role": arg.role,
-                    # XAI fields for report visualization
                     "key_points": arg.key_points or [],
+                    # Round 2+ interaction fields (XAI)
+                    "agree_with": arg.agree_with or [],
+                    "agree_reason": arg.agree_reason or "",
                     "disagree_with": arg.disagree_with or [],
                     "disagree_reason": arg.disagree_reason or "",
-                    "agree_with": arg.agree_with or [],
                     "changed": arg.changed or False,
-                    "change_reason": arg.change_reason or ""
+                    "change_reason": arg.change_reason or "",
+                    # Structured output fields from prompts
+                    "parts": getattr(arg, 'parts', None) or [],
+                    "decision_change": getattr(arg, 'decision_change', None) or "",
+                    "changed_from": getattr(arg, 'changed_from', None) or "",
+                    "change_trigger": getattr(arg, 'change_trigger', None) or "",
+                    "rebuttals": getattr(arg, 'rebuttals', None) or [],
+                    "key_parts_checked": getattr(arg, 'key_parts_checked', None) or []
                 }
             all_rounds_verdicts.append(round_data)
         
@@ -570,7 +577,7 @@ class AdaptiveDebateOrchestrator:
                     "role": arg.role
                 }
         
-        # All rounds verdicts for metrics visualization (Dec 24, 2025 - include XAI fields)
+        # All rounds verdicts for metrics visualization (Dec 24, 2025 - include all structured fields)
         all_rounds_verdicts = []
         for round_args in debate_history:
             round_data = {}
@@ -586,7 +593,14 @@ class AdaptiveDebateOrchestrator:
                     "disagree_reason": arg.disagree_reason or "",
                     "agree_with": arg.agree_with or [],
                     "changed": arg.changed or False,
-                    "change_reason": arg.change_reason or ""
+                    "change_reason": arg.change_reason or "",
+                    # Structured output fields from prompts
+                    "parts": getattr(arg, 'parts', None) or [],
+                    "decision_change": getattr(arg, 'decision_change', None) or "",
+                    "changed_from": getattr(arg, 'changed_from', None) or "",
+                    "change_trigger": getattr(arg, 'change_trigger', None) or "",
+                    "rebuttals": getattr(arg, 'rebuttals', None) or [],
+                    "key_parts_checked": getattr(arg, 'key_parts_checked', None) or []
                 }
             all_rounds_verdicts.append(round_data)
 
