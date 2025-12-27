@@ -110,43 +110,124 @@ def load_sample(idx: int) -> Tuple[str, str, str]:
 
 
 def format_debate_html(result: Dict[str, Any]) -> str:
-    """Format debate transcript as clean HTML (No MVP)."""
+    """Format debate transcript with full structured output."""
     all_rounds = result.get("debate_all_rounds_verdicts", [])
     
     if not all_rounds:
         return "<p style='color: #888; font-style: italic;'>Không có tranh luận (Độ tin cậy cao)</p>"
     
-    html = '<div style="font-size: 13px;">'
+    html = '<div style="font-size: 16px; line-height: 1.6;">'
     
     for round_num, round_data in enumerate(all_rounds, 1):
-        html += f'<details style="margin: 8px 0;"><summary style="cursor: pointer; font-weight: bold; color: #ddd;">Round {round_num}</summary>'
-        html += '<div style="padding: 10px; background: #252525; border-radius: 4px; margin-top: 5px;">'
+        html += f'<details open style="margin: 12px 0; border: 1px solid #444; border-radius: 8px;"><summary style="cursor: pointer; font-weight: bold; color: #fff; background: #1a1a1a; padding: 10px; border-radius: 8px 8px 0 0; font-size: 17px;">🔍 Round {round_num}</summary>'
+        html += '<div style="padding: 15px; background: #2a2a2a; border-radius: 0 0 8px 8px;">'
         
         for agent_name, agent_data in round_data.items():
             verdict = agent_data.get("verdict", "NEI")
-            # conf = agent_data.get("confidence", 0.0) # Hide confidence in debate to simplify
-            reasoning = agent_data.get("reasoning", "")[:200]
+            reasoning = agent_data.get("reasoning", "")
             
             verdict_color = "#4a7c59" if verdict == "SUPPORTED" else "#7c4a4a" if verdict == "REFUTED" else "#5a5a5a"
             
             html += f"""
-            <div style="margin: 8px 0; padding: 8px; background: #333; border-left: 3px solid {verdict_color}; border-radius: 3px;">
-                <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                    <strong>{agent_name.split('/')[-1]}</strong>
-                    <span style="background: {verdict_color}; padding: 1px 6px; border-radius: 4px; font-size: 10px;">{verdict}</span>
+            <div style="margin: 12px 0; padding: 12px; background: #333; border-left: 4px solid {verdict_color}; border-radius: 4px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 10px; align-items: center;">
+                    <strong style="color: #fff; font-size: 18px;">{agent_name.split('/')[-1]}</strong>
+                    <span style="background: {verdict_color}; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: bold; color: #fff;">{verdict}</span>
                 </div>
-                <p style="margin: 0; color: #ccc; font-size: 12px; line-height: 1.4;">{reasoning}...</p>
-            </div>
             """
+            
+            # Round 1: Show parts-based analysis
+            if round_num == 1:
+                parts = agent_data.get("parts", [])
+                if parts:
+                    html += '<div style="margin: 8px 0;"><strong style="color: #88c999; font-size: 15px;">📋 Key Parts Analysis:</strong></div>'
+                    html += '<div style="margin-left: 15px;">'
+                    for i, part in enumerate(parts, 1):
+                        part_text = part.get("part", "")
+                        status = part.get("status", "")
+                        quote = part.get("quote", "")
+                        
+                        status_color = "#4a7c59" if status == "COVERED" else "#7c4a4a" if status == "CONFLICT" else "#666"
+                        status_icon = "✅" if status == "COVERED" else "❌" if status == "CONFLICT" else "❓"
+                        
+                        html += f"""
+                        <div style="margin: 6px 0; padding: 10px; background: #404040; border-radius: 4px; border-left: 3px solid {status_color};">
+                            <div style="font-size: 16px; color: #ddd; font-weight: 500;"><strong>{i}.</strong> {part_text}</div>
+                            <div style="font-size: 15px; margin: 4px 0;"><span style="color: {status_color}; font-weight: bold;">{status_icon} {status}</span></div>
+                            <div style="font-size: 15px; color: #bbb; font-style: italic;">Quote: "{quote if quote and quote != 'NULL' else 'N/A'}"</div>
+                        </div>
+                        """
+                    html += '</div>'
+            
+            # Round 2+: Show rebuttal analysis (using same green color scheme as R1)
+            else:
+                key_parts = agent_data.get("key_parts_checked", [])
+                decision_change = agent_data.get("decision_change", "MAINTAIN")
+                rebuttals = agent_data.get("rebuttals", [])
+                
+                if key_parts:
+                    html += f'<div style="margin: 8px 0; font-size: 16px; color: #88c999;"><strong>🔍 Checked:</strong> {", ".join(key_parts)}</div>'
+                
+                # Use green color scheme consistent with R1
+                change_color = "#7c4a4a" if decision_change == "CHANGE" else "#4a7c59" if decision_change == "MAINTAIN" else "#88c999"
+                html += f'<div style="margin: 8px 0; font-size: 16px;"><strong style="color: {change_color}; font-size: 17px;">📝 Decision:</strong> <span style="color: {change_color}; font-weight: bold;">{decision_change}</span></div>'
+                
+                if rebuttals:
+                    html += '<div style="margin: 8px 0;"><strong style="color: #88c999; font-size: 17px;">💬 Rebuttals:</strong></div>'
+                    html += '<div style="margin-left: 15px;">'
+                    for reb in rebuttals:
+                        agent_name_reb = reb.get("agent", "")
+                        issue = reb.get("issue", "")
+                        counter_quote = reb.get("counter_quote", "")
+                        
+                        html += f"""
+                        <div style="margin: 6px 0; padding: 10px; background: #404040; border-radius: 4px; border-left: 3px solid #88c999;">
+                            <div style="font-size: 16px; color: #88c999; font-weight: bold;">vs {agent_name_reb}</div>
+                            <div style="font-size: 15px; color: #ddd;">Issue: {issue}</div>
+                            <div style="font-size: 15px; color: #bbb; font-style: italic;">Counter: "{counter_quote if counter_quote and counter_quote != 'NULL' else 'N/A'}"</div>
+                        </div>
+                        """
+                    html += '</div>'
+            
+            # Always show reasoning
+            if reasoning:
+                html += f'<div style="margin: 10px 0; padding: 12px; background: #1a1a1a; border-radius: 4px; font-size: 16px; color: #ddd; line-height: 1.5;">{reasoning}</div>'
+            
+            html += '</div>'
         
         html += '</div></details>'
     
-    # Judge info (Simplified, no MVP)
+    # Majority Vote - Visual representation with 3 debators
     metrics = result.get("debate_metrics", {})
     if metrics:
+        # Get final round verdicts for vote visualization
+        final_round = all_rounds[-1] if all_rounds else {}
+        debator_votes = []
+        for agent_name, agent_data in final_round.items():
+            verdict = agent_data.get("verdict", "NEI")
+            short_name = agent_name.split('/')[-1]
+            verdict_color = "#4a7c59" if verdict == "SUPPORTED" else "#7c4a4a" if verdict == "REFUTED" else "#5a5a5a"
+            debator_votes.append((short_name, verdict, verdict_color))
+        
         html += f"""
-        <div style="margin-top: 10px; padding: 8px; background: #2a3a4a; border-radius: 4px; font-size: 12px; color: #bcd;">
-            ⚖️ <strong>Majority Vote</strong> (Sau {metrics.get('rounds_used', '?')} rounds)
+        <div style="margin-top: 20px; padding: 15px; background: linear-gradient(135deg, #2a3a4a, #1a2a3a); border-radius: 8px; border-left: 4px solid #4a7c59;">
+            <div style="text-align: center; margin-bottom: 15px;">
+                <h4 style="color: #fff; margin: 0; font-size: 18px;">⚖️ Majority Vote</h4>
+                <div style="color: #bcd; font-size: 14px; margin-top: 5px;">{metrics.get('rounds_used', '?')} rounds • {metrics.get('stop_reason', 'unknown')}</div>
+            </div>
+            <div style="display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;">
+        """
+        
+        for short_name, verdict, verdict_color in debator_votes:
+            html += f"""
+                <div style="text-align: center; padding: 10px; background: #1a1a1a; border-radius: 8px; border: 2px solid {verdict_color}; min-width: 120px;">
+                    <div style="color: #fff; font-weight: bold; font-size: 14px; margin-bottom: 5px;">{short_name}</div>
+                    <div style="background: {verdict_color}; color: #fff; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: bold;">{verdict}</div>
+                </div>
+            """
+        
+        html += """
+            </div>
         </div>
         """
     
@@ -216,7 +297,7 @@ async def verify_claim(claim: str, evidence: str):
             hybrid_info = {"source": "MODEL_ONLY", "skipped": True}
 
         yield "", "", "", _status(
-            f"Routing: {'Fast Path (bỏ qua debate)' if skipped else 'Slow Path (tranh luận)'}..."
+            f"Routing: {'PhoBERT (model-only)' if skipped else 'Multi-Agent Debate'}..."
         ), ""
 
         result: Dict[str, Any] = {
@@ -236,7 +317,7 @@ async def verify_claim(claim: str, evidence: str):
             result["debate_all_rounds_verdicts"] = None
         else:
             # Slow Path debate
-            yield "", "", "", _status("Slow Path: đang tranh luận (debate)..."), ""
+            yield "", "", "", _status("Multi-Agent Debate: đang tranh luận..."), ""
 
             from src.pipeline.debate.debator import Evidence as DebateEvidence
 
@@ -255,6 +336,7 @@ async def verify_claim(claim: str, evidence: str):
             started_ts = last_event_ts
             current_round: int = 0
             phase: str = "debate"  # debate | judge
+            max_rounds_ui: str = "?"  # display only (e.g., "7" or "unlimited")
 
             def _progress_cb(event: str, payload: Dict[str, Any]):
                 q.put_nowait({"event": event, "payload": payload})
@@ -281,49 +363,59 @@ async def verify_claim(claim: str, evidence: str):
                             current_round = int(pl.get("round") or 0)
                         except Exception:
                             current_round = current_round or 0
+                        try:
+                            mr = pl.get("max_rounds")
+                            max_rounds_ui = str(mr) if mr is not None else max_rounds_ui
+                        except Exception:
+                            pass
                         phase = "debate"
-                        last_status_html = _status(f"Slow Path: Round {current_round} đang chạy...")
+                        last_status_html = _status(f"Multi-Agent Debate: Round {current_round}/{max_rounds_ui} đang chạy...")
                         yield "", "", "", last_status_html, ""
                     elif ev == "ROUND_DONE":
-                            vc = pl.get("vote_counts") or {}
-                            vc_txt = ", ".join([f"{k}:{v}" for k, v in vc.items()])
-                            try:
-                                current_round = int(pl.get("round") or current_round or 0)
-                            except Exception:
-                                pass
-                            phase = "debate"
-                            last_status_html = _status(f"Slow Path: Round {current_round} xong ({vc_txt})")
-                            yield "", "", "", last_status_html, ""
-                        elif ev == "JUDGE_START":
-                            last_status_html = _status("Tổng hợp kết quả debate...")
-                            phase = "judge"
-                            yield "", "", "", last_status_html, ""
-                        elif ev == "DEBATE_START":
-                            last_status_html = _status("Slow Path: bắt đầu tranh luận...")
-                            phase = "debate"
-                            yield "", "", "", last_status_html, ""
-                        elif ev == "JUDGE_DONE":
-                            v = pl.get("verdict")
-                            c = pl.get("confidence")
-                            last_status_html = _status(f"Đã tổng hợp: {v} (conf={c})")
-                            phase = "judge"
-                            yield "", "", "", last_status_html, ""
-                        else:
-                            # ignore other events
+                        vc = pl.get("vote_counts") or {}
+                        vc_txt = ", ".join([f"{k}:{v}" for k, v in vc.items()])
+                        try:
+                            current_round = int(pl.get("round") or current_round or 0)
+                        except Exception:
                             pass
-                    except asyncio.TimeoutError:
-                        # keep UI alive, but don't overwrite meaningful status
-                        now = asyncio.get_event_loop().time()
-                        if (now - last_event_ts) > 2.0 and (now - started_ts) > 2.0:
-                            # fallback if events are slow / missing
-                            if phase == "judge":
-                                last_status_html = _status("Đang tổng hợp kết quả...")
-                            else:
-                                fallback_round = current_round if current_round > 0 else 1
-                                last_status_html = _status(f"Slow Path: Round {fallback_round} đang chạy...")
+                        try:
+                            mr = pl.get("max_rounds")
+                            max_rounds_ui = str(mr) if mr is not None else max_rounds_ui
+                        except Exception:
+                            pass
+                        phase = "debate"
+                        last_status_html = _status(f"Multi-Agent Debate: Round {current_round}/{max_rounds_ui} xong ({vc_txt})")
                         yield "", "", "", last_status_html, ""
+                    elif ev == "JUDGE_START":
+                        last_status_html = _status("Tổng hợp kết quả debate...")
+                        phase = "judge"
+                        yield "", "", "", last_status_html, ""
+                    elif ev == "DEBATE_START":
+                        last_status_html = _status("Multi-Agent Debate: bắt đầu tranh luận...")
+                        phase = "debate"
+                        yield "", "", "", last_status_html, ""
+                    elif ev == "JUDGE_DONE":
+                        v = pl.get("verdict")
+                        c = pl.get("confidence")
+                        last_status_html = _status(f"Đã tổng hợp: {v} (conf={c})")
+                        phase = "judge"
+                        yield "", "", "", last_status_html, ""
+                    else:
+                        # ignore other events
+                        pass
+                except asyncio.TimeoutError:
+                    # keep UI alive, but don't overwrite meaningful status
+                    now = asyncio.get_event_loop().time()
+                    if (now - last_event_ts) > 2.0 and (now - started_ts) > 2.0:
+                        # fallback if events are slow / missing
+                        if phase == "judge":
+                            last_status_html = _status("Đang tổng hợp kết quả...")
+                        else:
+                            fallback_round = current_round if current_round > 0 else 1
+                            last_status_html = _status(f"Multi-Agent Debate: Round {fallback_round}/{max_rounds_ui} đang chạy...")
+                    yield "", "", "", last_status_html, ""
 
-                debate_result = await debate_task
+            debate_result = await debate_task
 
             result["debate_verdict"] = debate_result.verdict
             result["debate_confidence"] = round(float(debate_result.confidence), 4)
@@ -351,7 +443,7 @@ async def verify_claim(claim: str, evidence: str):
         # Determine path
         hybrid_info = result.get("hybrid_info", {}) or {}
         skipped = hybrid_info.get("skipped", False)
-        path_name = "Fast Path (PhoBERT)" if skipped else "Slow Path (Debate)"
+        path_name = "PhoBERT (model-only)" if skipped else "Multi-Agent Debate"
         
         # Verdict display
         # Translate to Vietnamese
@@ -386,7 +478,7 @@ async def verify_claim(claim: str, evidence: str):
         
         # Path display
         path_color = "#2e7d32" if skipped else "#1565c0"
-        path_name_vn = "Fast Path (Tốc độ)" if skipped else "Slow Path (Chi tiết)"
+        path_name_vn = "PhoBERT (Model-only)" if skipped else "Multi-Agent Debate"
         
         path_html = f"""
         <div style="text-align: center; margin-top: 10px;">
@@ -435,15 +527,14 @@ CUSTOM_CSS = """
     background: #121212 !important;
 }
 .status-row {
-    display: inline-flex;
+    display: flex;
     align-items: center;
-    gap: 10px;
-    color: #eeeeee;
-    font-size: 14px;
-    padding: 6px 10px;
-    border: 1px solid #333;
-    border-radius: 10px;
-    background: #1a1a1a;
+    gap: 8px;
+    padding: 8px 12px;
+    background: linear-gradient(135deg, #1a2332, #2a3342);
+    border-left: 4px solid #4a6fa5;
+    border-radius: 6px;
+    margin: 8px 0;
 }
 .spinner {
     width: 14px;
@@ -451,8 +542,17 @@ CUSTOM_CSS = """
     border: 2px solid #333;
     border-top-color: #4a6fa5;
     border-radius: 50%;
-    display: inline-block;
-    animation: spin 0.9s linear infinite;
+    animation: spin 1s linear infinite;
+}
+.debate-container {
+    max-height: 800px;
+    overflow-y: auto;
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 16px;
+    background: #1a1a1a;
+    font-size: 15px;
+    line-height: 1.6;
 }
 @keyframes spin {
     to { transform: rotate(360deg); }
@@ -541,26 +641,26 @@ def create_demo():
 
                 status = gr.HTML(label="Status", value="", visible=True)
         
-        gr.HTML("<hr style='border-color: #333; margin: 25px 0;'>")
+        gr.HTML("<hr style='border-color: #333; margin: 20px 0;'>")
         
-        # Results Layout
+        # Results + Debate Layout (side by side)
         with gr.Row():
-            with gr.Column():
-                gr.HTML("<h3 style='color: #fff; text-align: center; font-size: 20px;'>📊 KẾT QUẢ</h3>")
+            with gr.Column(scale=1):
+                gr.HTML("<h3 style='color: #fff; text-align: center; font-size: 20px; margin-bottom: 15px;'>📊 KẾT QUẢ</h3>")
                 verdict_output = gr.HTML(show_progress="hidden")
                 path_output = gr.HTML(show_progress="hidden")
-        
-        gr.HTML("<hr style='border-color: #333; margin: 25px 0;'>")
-        
-        with gr.Row():
-            with gr.Column():
-                gr.HTML("<h3 style='color: #fff; font-size: 20px;'>🗣️ TRANH LUẬN CHI TIẾT</h3>")
-                debate_output = gr.HTML(show_progress="hidden")
+            
+            with gr.Column(scale=3):  # Even bigger space for debate
+                gr.HTML("<h3 style='color: #fff; font-size: 20px; margin-bottom: 15px;'>🗣️ TRANH LUẬN CHI TIẾT</h3>")
+                debate_output = gr.HTML(show_progress="hidden", elem_classes=["debate-container"])
 
+        gr.HTML("<hr style='border-color: #333; margin: 20px 0;'>")
+        
+        # Dev trace (collapsed by default)
         with gr.Row():
             with gr.Column():
-                gr.HTML("<h3 style='color: #fff; font-size: 18px;'>🛠️ DEV TRACE</h3>")
-                dev_trace_output = gr.HTML(show_progress="hidden")
+                with gr.Accordion("🛠️ DEV TRACE", open=False):
+                    dev_trace_output = gr.HTML(show_progress="hidden")
         
         # Event handlers
         verify_btn.click(

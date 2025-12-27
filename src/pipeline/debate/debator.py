@@ -43,6 +43,13 @@ class DebateArgument:
     disagree_reason: Optional[str] = None
     changed: bool = False  # Whether verdict changed from R1
     change_reason: Optional[str] = None  # NEW_QUOTE, MISREAD, CONVINCED_BY_COLLEAGUE, NO_CHANGE
+    # Structured output fields from prompts
+    parts: Optional[List[Dict]] = None  # Round 1: parts analysis
+    decision_change: Optional[str] = None  # Round 2+: MAINTAIN/CONSIDER_CHANGE/CHANGE
+    changed_from: Optional[str] = None  # Round 2+: previous verdict if changed
+    change_trigger: Optional[str] = None  # Round 2+: reason for change
+    rebuttals: Optional[List[Dict]] = None  # Round 2+: rebuttal details
+    key_parts_checked: Optional[List[str]] = None  # Round 2+: parts examined
 
 
 class Debator(ABC):
@@ -537,8 +544,11 @@ Write a short research-style rebuttal.
             changed_from = data.get("changed_from", "")
             change_reason = f"Changed from {changed_from}" if changed and changed_from else ""
             
-            # Key parts checked (for metrics/debugging)
+            # Extract structured output fields
             key_parts_checked = data.get("key_parts_checked", [])
+            parts = data.get("parts", [])
+            rebuttals = data.get("rebuttals", [])
+            change_trigger = data.get("change_trigger", "")
             
             return DebateArgument(
                 debator_name=self.name,
@@ -555,7 +565,14 @@ Write a short research-style rebuttal.
                 disagree_with=disagree_with if disagree_with else None,
                 disagree_reason=disagree_reason if disagree_reason else None,
                 changed=changed,
-                change_reason=change_reason if change_reason else None
+                change_reason=change_reason if change_reason else None,
+                # Structured output fields from prompts
+                parts=parts if parts else None,
+                decision_change=decision_change if decision_change else None,
+                changed_from=changed_from if changed_from else None,
+                change_trigger=change_trigger if change_trigger else None,
+                rebuttals=rebuttals if rebuttals else None,
+                key_parts_checked=key_parts_checked if key_parts_checked else None
             )
         
         # Fallback: extract verdict from raw text
