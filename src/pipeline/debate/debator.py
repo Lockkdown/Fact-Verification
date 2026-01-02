@@ -303,6 +303,14 @@ Write a short research-style rebuttal.
                 verdict = "REFUTED"
             elif "SUPPORTED" in t or "SUPPORT" in t or "ĐÚNG" in t or "DUNG" in t:
                 verdict = "SUPPORTED"
+            
+            # For Round 1, create basic parts field để UI hiển thị
+            parts_fallback = None
+            if round_num == 1:
+                parts_fallback = [
+                    {"part": "Parse error - không thể phân tích chi tiết", "status": "MISSING", "quote": "NULL"}
+                ]
+            
             return DebateArgument(
                 debator_name=self.name,
                 role=self.role,
@@ -311,7 +319,14 @@ Write a short research-style rebuttal.
                 confidence=confidence,
                 reasoning=reason,
                 key_points=["Parse fallback"],
-                evidence_citations=[]
+                evidence_citations=[],
+                # Add missing structured fields for proper UI display
+                parts=parts_fallback,
+                decision_change=None,
+                changed_from=None,
+                change_trigger=None,
+                rebuttals=None,
+                key_parts_checked=None
             )
         
         # Clean response - remove markdown code blocks if present
